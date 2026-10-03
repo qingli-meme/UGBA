@@ -5,7 +5,6 @@
 # In[1]: 
 
 
-import imp
 import time
 import argparse
 import numpy as np
@@ -55,7 +54,7 @@ parser.add_argument('--vs_ratio', type=float, default=0,
 parser.add_argument('--vs_number', type=int, default=40,
                     help="number of poisoning nodes relative to the full graph")
 # defense setting
-parser.add_argument('--defense_mode', type=str, default="prune",
+parser.add_argument('--defense_mode', type=str, default="none",
                     choices=['prune', 'isolate', 'none'],
                     help="Mode of defense")
 parser.add_argument('--prune_thr', type=float, default=0.8,
@@ -94,26 +93,38 @@ parser.add_argument('--rpi_score_dir', type=str, default='./rpi_scores',
                     help='Directory used to save per-node RPI diagnostics')
 parser.add_argument('--rpi_verbose_every', type=int, default=100,
                     help='Print RPI scoring progress every N candidates; <=0 disables progress prints')
-parser.add_argument('--attack_method', type=str, default='ugba',
-                    choices=['ugba','fmrb'],
-                    help='Backdoor implementation: original UGBA or focused multi-relay backdoor')
-parser.add_argument('--relay_method', type=str, default='pfr',
-                    choices=['pfr','gain','low_degree','random'],
-                    help='Relay selection rule used by FMRB')
-parser.add_argument('--relay_count', type=int, default=-1,
-                    help='Number of relays/payloads per victim; <=0 reuses --trigger_size')
-parser.add_argument('--relay_eps', type=float, default=1e-12,
-                    help='Numerical epsilon in relay scoring')
-parser.add_argument('--trigger_mode', type=str, default='ugba',
-                    choices=['ugba', 'passband'],
-                    help='Original UGBA trigger or Passband-Matched Graph Backdoor')
-parser.add_argument('--pgb_m_neighbors', type=int, default=1,
-                    help='Existing neighbors each PGB trigger node also connects to')
-parser.add_argument('--pgb_pca_r', type=int, default=32)
-parser.add_argument('--pgb_lambda_manifold', type=float, default=1.0)
-parser.add_argument('--pgb_lambda_delta', type=float, default=1e-3)
-parser.add_argument('--pgb_delta_budget', type=float, default=1.0)
-parser.add_argument('--pgb_init_delta', type=float, default=0.5)
+parser.add_argument(
+    '--attack_method',
+    type=str,
+    default='ugba',
+    choices=['ugba', 'message_shortcut'],
+    help='Original UGBA or message-space shortcut backdoor',
+)
+parser.add_argument(
+    '--msg_code_mode',
+    type=str,
+    default='nonsemantic',
+    choices=['nonsemantic', 'unprojected', 'semantic'],
+    help=(
+        'nonsemantic: project q outside clean between-class message subspace; '
+        'unprojected: learn q freely; '
+        'semantic: force q along target-class clean semantic direction'
+    ),
+)
+parser.add_argument('--msg_init_scale', type=float, default=0.10,
+                    help='Initial norm rho of the shared message shortcut q')
+parser.add_argument('--msg_max_scale', type=float, default=1.0,
+                    help='Hard upper bound on shortcut norm')
+parser.add_argument('--msg_lambda_scale', type=float, default=1e-3,
+                    help='L2 penalty weight on message shortcut magnitude')
+parser.add_argument('--msg_outer_size', type=int, default=512,
+                    help='Number of unlabeled nodes used in outer transfer optimization')
+parser.add_argument('--msg_semantic_eps', type=float, default=1e-7,
+                    help='Numerical tolerance for semantic-subspace rank')
+parser.add_argument('--msg_verify_tol', type=float, default=1e-5,
+                    help='Maximum allowed L2 error for residual == q diagnostic')
+parser.add_argument('--msg_cos_tol', type=float, default=1e-5,
+                    help='Allowed cosine deviation from 1 for residual == q diagnostic')
 parser.add_argument('--test_model', type=str, default='GCN',
                     choices=['GCN','GAT','GraphSage','GIN'],
                     help='Model used to attack')
@@ -175,8 +186,7 @@ mask_edge_index = data.edge_index[:,torch.bitwise_not(edge_mask)]
 
 from sklearn_extra import cluster
 from models.backdoor import Backdoor
-from models.distributed_backdoor import DistributedRelayBackdoor
-from models.passband_backdoor import PassbandBackdoor
+from models.message_shortcut_backdoor import MessageShortcutBackdoor
 from models.construct import model_construct
 import heuristic_selection as hs
 import rpi_selection as rpis
@@ -232,12 +242,8 @@ unlabeled_idx = torch.tensor(list(set(unlabeled_idx.cpu().numpy()) - set(idx_att
 print(unlabeled_idx)
 # In[10]:
 # train trigger generator 
-if args.trigger_mode == 'passband':
-    if args.attack_method != 'ugba':
-        raise ValueError('--trigger_mode passband cannot be combined with --attack_method fmrb')
-    model = PassbandBackdoor(args,device)
-elif args.attack_method == 'fmrb':
-    model = DistributedRelayBackdoor(args,device)
+if args.attack_method == 'message_shortcut':
+    model = MessageShortcutBackdoor(args, device)
 else:
     model = Backdoor(args,device)
 model.fit(data.x, train_edge_index, None, data.y, idx_train,idx_attach, unlabeled_idx)
@@ -304,24 +310,13 @@ for test_model in models:
                 sub_induct_edge_weights = torch.ones([sub_induct_edge_index.shape[1]]).to(device)
                 with torch.no_grad():
                     # inject trigger on attack test nodes (idx_atk)'''
-                    if args.attack_method == 'fmrb':
-                        eligible_relay_mask = (sub_induct_nodeset < data.x.shape[0]).to(device)
-                        induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
-                            relabeled_node_idx,
-                            poison_x[sub_induct_nodeset],
-                            sub_induct_edge_index,
-                            sub_induct_edge_weights,
-                            device,
-                            eligible_relay_mask=eligible_relay_mask,
-                        )
-                    else:
-                        induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
-                            relabeled_node_idx,
-                            poison_x[sub_induct_nodeset],
-                            sub_induct_edge_index,
-                            sub_induct_edge_weights,
-                            device,
-                        )
+                    induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
+                        relabeled_node_idx,
+                        poison_x[sub_induct_nodeset],
+                        sub_induct_edge_index,
+                        sub_induct_edge_weights,
+                        device,
+                    )
                     induct_x, induct_edge_index,induct_edge_weights = induct_x.clone().detach(), induct_edge_index.clone().detach(),induct_edge_weights.clone().detach()
                     # # do pruning in test datas'''
                     if(args.defense_mode == 'prune' or args.defense_mode == 'isolate'):
@@ -340,26 +335,13 @@ for test_model in models:
             print("Flip ASR: {:.4f}/{} nodes".format(flip_asr,flip_idx_atk.shape[0]))
         elif(args.evaluate_mode == 'overall'):
             # %% inject trigger on attack test nodes (idx_atk)'''
-            if args.attack_method == 'fmrb':
-                eligible_relay_mask = (
-                    torch.arange(poison_x.shape[0], device=device) < data.x.shape[0]
-                )
-                induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
-                    idx_atk,
-                    poison_x,
-                    induct_edge_index,
-                    induct_edge_weights,
-                    device,
-                    eligible_relay_mask=eligible_relay_mask,
-                )
-            else:
-                induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
-                    idx_atk,
-                    poison_x,
-                    induct_edge_index,
-                    induct_edge_weights,
-                    device,
-                )
+            induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
+                idx_atk,
+                poison_x,
+                induct_edge_index,
+                induct_edge_weights,
+                device,
+            )
             induct_x, induct_edge_index,induct_edge_weights = induct_x.clone().detach(), induct_edge_index.clone().detach(),induct_edge_weights.clone().detach()
             # do pruning in test datas'''
             if(args.defense_mode == 'prune' or args.defense_mode == 'isolate'):
