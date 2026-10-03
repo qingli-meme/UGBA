@@ -397,11 +397,28 @@ for test_model in models:
                             'GraphSAGE' if args.test_model == 'GraphSage'
                             else args.test_model
                         )
+                        plan = model.last_injection_plan
+                        q_now = model.shortcut().detach()
+                        victim_feature = poison_x[sub_induct_nodeset][
+                            int(relabeled_node_idx.item())
+                        ]
+                        trigger_feature = induct_x[plan.trigger_ids[0, 0]]
+                        payload_feature = q_now / plan.c[0, 0]
+                        victim_l1 = victim_feature.abs().sum().clamp_min(1e-12)
                         msg_diagnostics.rows[architecture_key][-1].update({
                             'payload_residual_l2': realization_diag['payload_l2_max'],
                             'payload_residual_cos': realization_diag['payload_cos_min'],
                             'total_residual_q_cos': realization_diag['total_q_cos_min'],
                             'total_residual_norm_ratio': realization_diag['total_norm_ratio_min'],
+                            'payload_amp_ratio': float(
+                                payload_feature.norm()
+                                / victim_feature.norm().clamp_min(1e-12)
+                            ),
+                            'trigger_l1': float(trigger_feature.abs().sum()),
+                            'victim_l1': float(victim_l1),
+                            'trigger_l1_ratio': float(
+                                trigger_feature.abs().sum() / victim_l1
+                            ),
                         })
                     train_attach_rate = (output.argmax(dim=1)[relabeled_node_idx]==args.target_class).float().mean()
                     asr += train_attach_rate
@@ -472,23 +489,52 @@ if msg_diagnostics is not None:
         'prevalence_min': args.msg_prevalence_min,
         'semantic_quantile': args.msg_semantic_quantile,
     }
+    q_final = model.shortcut().detach()
+    q_l1 = float(q_final.abs().sum())
+    q_l2 = float(q_final.norm())
+    msg_summary['shortcut'].update({
+        'q_norm_l1': q_l1,
+        'q_norm_l2': q_l2,
+        'q_l1_l2_ratio': q_l1 / max(q_l2, 1e-12),
+        'q_nnz': int((q_final.abs() > 1e-12).sum()),
+    })
+    clean_l1 = data.x.abs().sum(dim=1).detach().cpu().numpy()
+    msg_summary['clean_reference']['l1'] = {
+        'mean': float(clean_l1.mean()),
+        'median': float(np.median(clean_l1)),
+        'p05': float(np.percentile(clean_l1, 5)),
+        'p95': float(np.percentile(clean_l1, 95)),
+    }
     realization_keys = [
         'payload_residual_l2', 'payload_residual_cos',
         'total_residual_q_cos', 'total_residual_norm_ratio',
+        'payload_amp_ratio', 'trigger_l1', 'victim_l1',
+        'trigger_l1_ratio',
     ]
     msg_summary['realization_diagnostics'] = {}
     for architecture, rows in msg_diagnostics.rows.items():
         msg_summary['realization_diagnostics'][architecture] = {}
-        for key in realization_keys:
-            values = np.asarray([row[key] for row in rows], dtype=float)
-            msg_summary['realization_diagnostics'][architecture][key] = {
-                'mean': float(values.mean()),
-                'median': float(np.median(values)),
-                'p05': float(np.percentile(values, 5)),
-                'p95': float(np.percentile(values, 95)),
-                'min': float(values.min()),
-                'max': float(values.max()),
-            }
+        groups = {
+            'ALL': rows,
+            'SUCCESS': [row for row in rows if row['success']],
+            'FAILED': [row for row in rows if not row['success']],
+        }
+        for group_name, group_rows in groups.items():
+            msg_summary['realization_diagnostics'][architecture][group_name] = {}
+            for key in realization_keys:
+                values = np.asarray([row[key] for row in group_rows], dtype=float)
+                msg_summary['realization_diagnostics'][architecture][group_name][key] = {
+                    'count': int(len(values)),
+                    'mean': float(values.mean()) if len(values) else None,
+                    'median': float(np.median(values)) if len(values) else None,
+                    'p05': float(np.percentile(values, 5)) if len(values) else None,
+                    'p10': float(np.percentile(values, 10)) if len(values) else None,
+                    'p25': float(np.percentile(values, 25)) if len(values) else None,
+                    'p75': float(np.percentile(values, 75)) if len(values) else None,
+                    'p90': float(np.percentile(values, 90)) if len(values) else None,
+                    'p95': float(np.percentile(values, 95)) if len(values) else None,
+                    'max': float(values.max()) if len(values) else None,
+                }
     with (Path(args.msg_diag_dir) / 'summary.json').open('w') as fh:
         json.dump(msg_summary, fh, indent=2, sort_keys=True)
     print("[MSG-DIAG-V2] wrote CSV/JSON diagnostics to {}".format(args.msg_diag_dir))
