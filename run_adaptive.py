@@ -70,8 +70,50 @@ parser.add_argument('--homo_boost_thrd', type=float, default=0.8,
 parser.add_argument('--dis_weight', type=float, default=1,
                     help="Weight of cluster distance")
 parser.add_argument('--selection_method', type=str, default='none',
-                    choices=['loss','conf','cluster','none','cluster_degree'],
+                    choices=['loss','conf','cluster','none','cluster_degree','rpi','rpi_gap','rpi_sensitivity','fixed'],
                     help='Method to select idx_attach for training trojan model (none means randomly select)')
+parser.add_argument('--fixed_attach_file', type=str, default='',
+                    help='Text file containing explicit node IDs for Phase-2 utility validation')
+# RPI selection setting -- only used when --selection_method rpi
+parser.add_argument('--rpi_surrogate_model', type=str, default='GCN',
+                    choices=['GCN','GAT','GraphSage'],
+                    help='Clean surrogate used only for offline RPI scoring')
+parser.add_argument('--rpi_mc_samples', type=int, default=4,
+                    help='Number of topology samples for RPI; first sample is the clean graph')
+parser.add_argument('--rpi_edge_drop', type=float, default=0.10,
+                    help='Undirected clean-edge drop probability for robust RPI samples')
+parser.add_argument('--rpi_kappa', type=float, default=0.0,
+                    help='Required target decision margin used in the minimum propagation cost')
+parser.add_argument('--rpi_eps', type=float, default=1e-12,
+                    help='Numerical stabilizer in RPI denominator')
+parser.add_argument('--rpi_max_candidates', type=int, default=0,
+                    help='Optional cap for large graphs; 0 scores all eligible candidates')
+parser.add_argument('--rpi_no_class_balance', action='store_true', default=False,
+                    help='Disable class-balanced final Bottom-K selection')
+parser.add_argument('--rpi_score_dir', type=str, default='./rpi_scores',
+                    help='Directory used to save per-node RPI diagnostics')
+parser.add_argument('--rpi_verbose_every', type=int, default=100,
+                    help='Print RPI scoring progress every N candidates; <=0 disables progress prints')
+parser.add_argument('--attack_method', type=str, default='ugba',
+                    choices=['ugba','fmrb'],
+                    help='Backdoor implementation: original UGBA or focused multi-relay backdoor')
+parser.add_argument('--relay_method', type=str, default='pfr',
+                    choices=['pfr','gain','low_degree','random'],
+                    help='Relay selection rule used by FMRB')
+parser.add_argument('--relay_count', type=int, default=-1,
+                    help='Number of relays/payloads per victim; <=0 reuses --trigger_size')
+parser.add_argument('--relay_eps', type=float, default=1e-12,
+                    help='Numerical epsilon in relay scoring')
+parser.add_argument('--trigger_mode', type=str, default='ugba',
+                    choices=['ugba', 'passband'],
+                    help='Original UGBA trigger or Passband-Matched Graph Backdoor')
+parser.add_argument('--pgb_m_neighbors', type=int, default=1,
+                    help='Existing neighbors each PGB trigger node also connects to')
+parser.add_argument('--pgb_pca_r', type=int, default=32)
+parser.add_argument('--pgb_lambda_manifold', type=float, default=1.0)
+parser.add_argument('--pgb_lambda_delta', type=float, default=1e-3)
+parser.add_argument('--pgb_delta_budget', type=float, default=1.0)
+parser.add_argument('--pgb_init_delta', type=float, default=0.5)
 parser.add_argument('--test_model', type=str, default='GCN',
                     choices=['GCN','GAT','GraphSage','GIN'],
                     help='Model used to attack')
@@ -133,8 +175,11 @@ mask_edge_index = data.edge_index[:,torch.bitwise_not(edge_mask)]
 
 from sklearn_extra import cluster
 from models.backdoor import Backdoor
+from models.distributed_backdoor import DistributedRelayBackdoor
+from models.passband_backdoor import PassbandBackdoor
 from models.construct import model_construct
 import heuristic_selection as hs
+import rpi_selection as rpis
 
 # from kmeans_pytorch import kmeans, kmeans_predict
 
@@ -158,12 +203,43 @@ elif(args.selection_method == 'cluster_degree'):
     else:
         idx_attach = hs.cluster_degree_selection(args,data,idx_train,idx_val,idx_clean_test,unlabeled_idx,train_edge_index,size,device)
     idx_attach = torch.LongTensor(idx_attach).to(device)
+elif(args.selection_method in ['rpi', 'rpi_gap', 'rpi_sensitivity']):
+    idx_attach = rpis.robust_propagation_selection(
+        args=args,
+        data=data,
+        idx_train=idx_train,
+        idx_val=idx_val,
+        idx_clean_test=idx_clean_test,
+        unlabeled_idx=unlabeled_idx,
+        train_edge_index=train_edge_index,
+        size=size,
+        device=device,
+    )
+elif(args.selection_method == 'fixed'):
+    if not args.fixed_attach_file:
+        raise ValueError('--fixed_attach_file is required for selection_method=fixed')
+    fixed_nodes = np.loadtxt(args.fixed_attach_file, dtype=int, ndmin=1)
+    if len(fixed_nodes) != size:
+        raise ValueError('fixed attach file contains {} nodes, expected {}'.format(
+            len(fixed_nodes), size))
+    eligible_nodes = set(unlabeled_idx.detach().cpu().tolist())
+    invalid_nodes = [int(node) for node in fixed_nodes if int(node) not in eligible_nodes]
+    if invalid_nodes:
+        raise ValueError('fixed attach file contains ineligible nodes: {}'.format(invalid_nodes))
+    idx_attach = torch.as_tensor(fixed_nodes, dtype=torch.long, device=device)
 print("idx_attach: {}".format(idx_attach))
 unlabeled_idx = torch.tensor(list(set(unlabeled_idx.cpu().numpy()) - set(idx_attach.cpu().numpy()))).to(device)
 print(unlabeled_idx)
 # In[10]:
 # train trigger generator 
-model = Backdoor(args,device)
+if args.trigger_mode == 'passband':
+    if args.attack_method != 'ugba':
+        raise ValueError('--trigger_mode passband cannot be combined with --attack_method fmrb')
+    model = PassbandBackdoor(args,device)
+elif args.attack_method == 'fmrb':
+    model = DistributedRelayBackdoor(args,device)
+else:
+    model = Backdoor(args,device)
 model.fit(data.x, train_edge_index, None, data.y, idx_train,idx_attach, unlabeled_idx)
 poison_x, poison_edge_index, poison_edge_weights, poison_labels = model.get_poisoned()
 
@@ -228,7 +304,24 @@ for test_model in models:
                 sub_induct_edge_weights = torch.ones([sub_induct_edge_index.shape[1]]).to(device)
                 with torch.no_grad():
                     # inject trigger on attack test nodes (idx_atk)'''
-                    induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(relabeled_node_idx,poison_x[sub_induct_nodeset],sub_induct_edge_index,sub_induct_edge_weights,device)
+                    if args.attack_method == 'fmrb':
+                        eligible_relay_mask = (sub_induct_nodeset < data.x.shape[0]).to(device)
+                        induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
+                            relabeled_node_idx,
+                            poison_x[sub_induct_nodeset],
+                            sub_induct_edge_index,
+                            sub_induct_edge_weights,
+                            device,
+                            eligible_relay_mask=eligible_relay_mask,
+                        )
+                    else:
+                        induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
+                            relabeled_node_idx,
+                            poison_x[sub_induct_nodeset],
+                            sub_induct_edge_index,
+                            sub_induct_edge_weights,
+                            device,
+                        )
                     induct_x, induct_edge_index,induct_edge_weights = induct_x.clone().detach(), induct_edge_index.clone().detach(),induct_edge_weights.clone().detach()
                     # # do pruning in test datas'''
                     if(args.defense_mode == 'prune' or args.defense_mode == 'isolate'):
@@ -247,7 +340,26 @@ for test_model in models:
             print("Flip ASR: {:.4f}/{} nodes".format(flip_asr,flip_idx_atk.shape[0]))
         elif(args.evaluate_mode == 'overall'):
             # %% inject trigger on attack test nodes (idx_atk)'''
-            induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(idx_atk,poison_x,induct_edge_index,induct_edge_weights,device)
+            if args.attack_method == 'fmrb':
+                eligible_relay_mask = (
+                    torch.arange(poison_x.shape[0], device=device) < data.x.shape[0]
+                )
+                induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
+                    idx_atk,
+                    poison_x,
+                    induct_edge_index,
+                    induct_edge_weights,
+                    device,
+                    eligible_relay_mask=eligible_relay_mask,
+                )
+            else:
+                induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
+                    idx_atk,
+                    poison_x,
+                    induct_edge_index,
+                    induct_edge_weights,
+                    device,
+                )
             induct_x, induct_edge_index,induct_edge_weights = induct_x.clone().detach(), induct_edge_index.clone().detach(),induct_edge_weights.clone().detach()
             # do pruning in test datas'''
             if(args.defense_mode == 'prune' or args.defense_mode == 'isolate'):

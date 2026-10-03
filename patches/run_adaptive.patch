@@ -1,0 +1,50 @@
+--- a/run_adaptive.py
++++ b/run_adaptive.py
+@@
+ parser.add_argument('--selection_method', type=str, default='none',
+-                    choices=['loss','conf','cluster','none','cluster_degree'],
++                    choices=['loss','conf','cluster','none','cluster_degree','rpi'],
+                     help='Method to select idx_attach for training trojan model (none means randomly select)')
++# RPI selection setting -- only used when --selection_method rpi
++parser.add_argument('--rpi_surrogate_model', type=str, default='GCN',
++                    choices=['GCN','GAT','GraphSage'],
++                    help='Clean surrogate used only for offline RPI scoring')
++parser.add_argument('--rpi_mc_samples', type=int, default=4,
++                    help='Number of topology samples for RPI; first sample is the clean graph')
++parser.add_argument('--rpi_edge_drop', type=float, default=0.10,
++                    help='Undirected clean-edge drop probability for robust RPI samples')
++parser.add_argument('--rpi_kappa', type=float, default=0.0,
++                    help='Required target decision margin used in the minimum propagation cost')
++parser.add_argument('--rpi_eps', type=float, default=1e-12,
++                    help='Numerical stabilizer in RPI denominator')
++parser.add_argument('--rpi_max_candidates', type=int, default=0,
++                    help='Optional cap for large graphs; 0 scores all eligible candidates')
++parser.add_argument('--rpi_no_class_balance', action='store_true', default=False,
++                    help='Disable class-balanced final Bottom-K selection')
++parser.add_argument('--rpi_score_dir', type=str, default='./rpi_scores',
++                    help='Directory used to save per-node RPI diagnostics')
++parser.add_argument('--rpi_verbose_every', type=int, default=100,
++                    help='Print RPI scoring progress every N candidates; <=0 disables progress prints')
+@@
+ import heuristic_selection as hs
++import rpi_selection as rpis
+@@
+ elif(args.selection_method == 'cluster_degree'):
+     if(args.dataset == 'Pubmed'):
+         idx_attach = hs.cluster_degree_selection_seperate_fixed(args,data,idx_train,idx_val,idx_clean_test,unlabeled_idx,train_edge_index,size,device)
+     else:
+         idx_attach = hs.cluster_degree_selection(args,data,idx_train,idx_val,idx_clean_test,unlabeled_idx,train_edge_index,size,device)
+     idx_attach = torch.LongTensor(idx_attach).to(device)
++elif(args.selection_method == 'rpi'):
++    idx_attach = rpis.robust_propagation_selection(
++        args=args,
++        data=data,
++        idx_train=idx_train,
++        idx_val=idx_val,
++        idx_clean_test=idx_clean_test,
++        unlabeled_idx=unlabeled_idx,
++        train_edge_index=train_edge_index,
++        size=size,
++        device=device,
++    )
+ print("idx_attach: {}".format(idx_attach))
