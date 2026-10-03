@@ -7,6 +7,8 @@
 
 import time
 import argparse
+import json
+from pathlib import Path
 import numpy as np
 import torch
 
@@ -104,13 +106,22 @@ parser.add_argument(
     '--msg_code_mode',
     type=str,
     default='nonsemantic',
-    choices=['nonsemantic', 'unprojected', 'semantic'],
+    choices=['nonsemantic', 'dense_nonsemantic', 'sparse_positive', 'unprojected', 'semantic'],
     help=(
         'nonsemantic: project q outside clean between-class message subspace; '
         'unprojected: learn q freely; '
         'semantic: force q along target-class clean semantic direction'
     ),
 )
+parser.add_argument('--msg_realization', type=str, default='legacy_exact_total',
+                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier'],
+                    help='Raw-feature realization of the shared message shortcut')
+parser.add_argument('--msg_shortcut_k', type=int, default=5,
+                    help='Number of active coordinates in sparse-positive q')
+parser.add_argument('--msg_prevalence_min', type=float, default=0.005,
+                    help='Minimum clean-training prevalence for sparse q coordinates')
+parser.add_argument('--msg_semantic_quantile', type=float, default=0.70,
+                    help='Low-semantic feature quantile eligible for sparse q')
 parser.add_argument('--msg_init_scale', type=float, default=0.10,
                     help='Initial norm rho of the shared message shortcut q')
 parser.add_argument('--msg_max_scale', type=float, default=1.0,
@@ -284,7 +295,8 @@ print("precent of left attach nodes: {:.3f}"\
     .format(len(set(bkd_tn_nodes.tolist()) & set(idx_attach.tolist()))/len(idx_attach)))
 
 
-models = ['GCN','GAT', 'GraphSage']
+models = [args.test_model]
+evaluation_summary = {}
 total_overall_asr = 0
 total_overall_ca = 0
 for test_model in models:
@@ -372,6 +384,25 @@ for test_model in models:
                             trigger_edge_weight=induct_edge_weights,
                             plan=model.last_injection_plan,
                         )
+                        import message_shortcut as ms
+                        realization_diag = ms.diagnose_payload_residual(
+                            base_features=poison_x[sub_induct_nodeset],
+                            base_edge_index=sub_induct_edge_index,
+                            base_edge_weight=sub_induct_edge_weights,
+                            plan=model.last_injection_plan,
+                            q=model.shortcut().detach(),
+                            realization=args.msg_realization,
+                        )
+                        architecture_key = (
+                            'GraphSAGE' if args.test_model == 'GraphSage'
+                            else args.test_model
+                        )
+                        msg_diagnostics.rows[architecture_key][-1].update({
+                            'payload_residual_l2': realization_diag['payload_l2_max'],
+                            'payload_residual_cos': realization_diag['payload_cos_min'],
+                            'total_residual_q_cos': realization_diag['total_q_cos_min'],
+                            'total_residual_norm_ratio': realization_diag['total_norm_ratio_min'],
+                        })
                     train_attach_rate = (output.argmax(dim=1)[relabeled_node_idx]==args.target_class).float().mean()
                     asr += train_attach_rate
                     if(data.y[idx] != args.target_class):
@@ -418,6 +449,10 @@ for test_model in models:
     overall_ca = overall_ca/len(seeds)
     print("Overall ASR: {:.4f} ({} model, Seed: {})".format(overall_asr, args.test_model, args.seed))
     print("Overall Clean Accuracy: {:.4f}".format(overall_ca))
+    evaluation_summary[args.test_model] = {
+        'asr': float(overall_asr),
+        'clean_accuracy': float(overall_ca),
+    }
 
     total_overall_asr += overall_asr
     total_overall_ca += overall_ca
@@ -428,5 +463,32 @@ total_overall_ca = total_overall_ca/len(models)
 print("Total Overall ASR: {:.4f} ".format(total_overall_asr))
 print("Total Clean Accuracy: {:.4f}".format(total_overall_ca))
 if msg_diagnostics is not None:
-    msg_diagnostics.finalize()
+    msg_summary = msg_diagnostics.finalize()
+    msg_summary['evaluation'] = evaluation_summary
+    msg_summary['realization'] = {
+        'code_mode': args.msg_code_mode,
+        'message_realization': args.msg_realization,
+        'shortcut_k': args.msg_shortcut_k,
+        'prevalence_min': args.msg_prevalence_min,
+        'semantic_quantile': args.msg_semantic_quantile,
+    }
+    realization_keys = [
+        'payload_residual_l2', 'payload_residual_cos',
+        'total_residual_q_cos', 'total_residual_norm_ratio',
+    ]
+    msg_summary['realization_diagnostics'] = {}
+    for architecture, rows in msg_diagnostics.rows.items():
+        msg_summary['realization_diagnostics'][architecture] = {}
+        for key in realization_keys:
+            values = np.asarray([row[key] for row in rows], dtype=float)
+            msg_summary['realization_diagnostics'][architecture][key] = {
+                'mean': float(values.mean()),
+                'median': float(np.median(values)),
+                'p05': float(np.percentile(values, 5)),
+                'p95': float(np.percentile(values, 95)),
+                'min': float(values.min()),
+                'max': float(values.max()),
+            }
+    with (Path(args.msg_diag_dir) / 'summary.json').open('w') as fh:
+        json.dump(msg_summary, fh, indent=2, sort_keys=True)
     print("[MSG-DIAG-V2] wrote CSV/JSON diagnostics to {}".format(args.msg_diag_dir))

@@ -1,8 +1,7 @@
 """UGBA-compatible Message-Passing Shortcut Backdoor.
 
-Main principle:
-    For every attached victim v,
-        AGG(G + T_v)[v] - AGG(G)[v] == q
+Main v4 principle:
+    For every attached victim v, the feature-induced payload residual is q.
 
 where q is shared across poisoned/test victims.
 
@@ -73,7 +72,16 @@ class MessageShortcutBackdoor:
 
     def _materialize(self, features, plan):
         q = self.shortcut()
-        return plan.materialize(features, q)
+        realization = getattr(
+            self.args, "msg_realization", "legacy_exact_total"
+        )
+        if realization == "legacy_exact_total":
+            return plan.materialize(features, q)
+        if realization == "exact_payload_zero":
+            return ms.materialize_exact_payload_zero(features, plan, q)
+        if realization == "exact_payload_carrier":
+            return ms.materialize_exact_payload_carrier(features, plan, q)
+        raise ValueError("Unknown message realization: {}".format(realization))
 
     def fit(
         self,
@@ -159,15 +167,45 @@ class MessageShortcutBackdoor:
         # ------------------------------------------------------------
         # 2) Learn shared shortcut q.
         # ------------------------------------------------------------
-        self.shortcut = ms.MessageShortcutCode(
-            feat_dim=features.size(1),
-            semantic_basis=self.semantic_basis,
-            target_semantic_direction=self.target_semantic_direction,
-            mode=args.msg_code_mode,
-            init_scale=args.msg_init_scale,
-            max_scale=args.msg_max_scale,
-            device=self.device,
-        ).to(self.device)
+        code_mode = getattr(args, "msg_code_mode", "nonsemantic")
+        if code_mode == "sparse_positive":
+            feature_mask = ms.build_sparse_positive_mask(
+                features=features,
+                semantic_basis=self.semantic_basis,
+                idx_train=idx_train,
+                k=args.msg_shortcut_k,
+                semantic_quantile=args.msg_semantic_quantile,
+                prevalence_min=args.msg_prevalence_min,
+            )
+            self.shortcut = ms.SparsePositiveShortcutCode(
+                feature_mask=feature_mask,
+                semantic_basis=self.semantic_basis,
+                init_scale=args.msg_init_scale,
+                max_scale=args.msg_max_scale,
+                device=self.device,
+            ).to(self.device)
+            prevalence = (features[idx_train] > 0).float().mean(dim=0)
+            print(
+                "[MSG-MASK] K={} ids={} prevalence(mean/min/max)="
+                "{:.6f}/{:.6f}/{:.6f}".format(
+                    int(feature_mask.sum()),
+                    feature_mask.nonzero(as_tuple=False).flatten().tolist(),
+                    float(prevalence[feature_mask].mean()),
+                    float(prevalence[feature_mask].min()),
+                    float(prevalence[feature_mask].max()),
+                )
+            )
+        else:
+            legacy_mode = "nonsemantic" if code_mode == "dense_nonsemantic" else code_mode
+            self.shortcut = ms.MessageShortcutCode(
+                feat_dim=features.size(1),
+                semantic_basis=self.semantic_basis,
+                target_semantic_direction=self.target_semantic_direction,
+                mode=legacy_mode,
+                init_scale=args.msg_init_scale,
+                max_scale=args.msg_max_scale,
+                device=self.device,
+            ).to(self.device)
 
         self.shadow_model = GCN(
             nfeat=features.size(1),
@@ -384,31 +422,47 @@ class MessageShortcutBackdoor:
         with torch.no_grad():
             q = self.shortcut()
 
-            diag = ms.diagnose_message_residual(
+            realization = getattr(
+                args, "msg_realization", "legacy_exact_total"
+            )
+            diag = ms.diagnose_payload_residual(
                 base_features=features,
                 base_edge_index=edge_index,
                 base_edge_weight=edge_weight,
                 plan=self.attach_plan,
                 q=q,
+                realization=realization,
             )
 
         print(
-            "[MSG-FINAL] mode={} q_norm={:.6f} "
-            "semantic_leakage={:.6e}".format(
+            "[MSG-FINAL] mode={} realization={} q_norm={:.6f} "
+            "q_nnz={} semantic_leakage={:.6e}".format(
                 args.msg_code_mode,
+                realization,
                 float(q.norm()),
+                int((q.abs() > 1e-12).sum()),
                 self.shortcut.semantic_leakage(),
             )
         )
 
         print(
-            "[MSG-RESIDUAL] l2(mean/max)="
+            "[MSG-PAYLOAD] l2(mean/max)="
             "{:.6e}/{:.6e} | cos(mean/min)="
             "{:.8f}/{:.8f}".format(
-                diag["l2_mean"],
-                diag["l2_max"],
-                diag["cos_mean"],
-                diag["cos_min"],
+                diag["payload_l2_mean"],
+                diag["payload_l2_max"],
+                diag["payload_cos_mean"],
+                diag["payload_cos_min"],
+            )
+        )
+
+        print(
+            "[MSG-TOTAL] q_cos(mean/min)={:.8f}/{:.8f} | "
+            "norm_ratio(mean/min)={:.8f}/{:.8f}".format(
+                diag["total_q_cos_mean"],
+                diag["total_q_cos_min"],
+                diag["total_norm_ratio_mean"],
+                diag["total_norm_ratio_min"],
             )
         )
 
@@ -420,13 +474,22 @@ class MessageShortcutBackdoor:
             )
         )
 
-        # The central construction should be numerically exact.
-        if (
-            diag["l2_max"] > args.msg_verify_tol
-            or diag["cos_min"] < 1.0 - args.msg_cos_tol
-        ):
+        if realization == "legacy_exact_total":
+            total_error = (
+                diag["total_residual"] - q.view(1, -1)
+            ).norm(dim=1)
+            invariant_failed = (
+                float(total_error.max()) > args.msg_verify_tol
+                or diag["total_q_cos_min"] < 1.0 - args.msg_cos_tol
+            )
+        else:
+            invariant_failed = (
+                diag["payload_l2_max"] > args.msg_verify_tol
+                or diag["payload_cos_min"] < 1.0 - args.msg_cos_tol
+            )
+        if invariant_failed:
             raise RuntimeError(
-                "Inverse-message construction failed numerical verification: "
+                "Message realization failed numerical verification: "
                 f"{diag}"
             )
 
@@ -462,10 +525,8 @@ class MessageShortcutBackdoor:
         self.last_injection_plan = plan
 
         with torch.no_grad():
-            q = self.shortcut()
-            update_x, update_ei, update_ew, _ = plan.materialize(
-                features,
-                q,
+            update_x, update_ei, update_ew, _ = self._materialize(
+                features, plan
             )
 
         return update_x, update_ei, update_ew

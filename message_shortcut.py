@@ -205,6 +205,44 @@ def project_out(
     return v - basis.t() @ (basis @ v)
 
 
+def build_sparse_positive_mask(
+    features: torch.Tensor,
+    semantic_basis: torch.Tensor,
+    idx_train: torch.Tensor,
+    k: int,
+    semantic_quantile: float = 0.70,
+    prevalence_min: float = 0.005,
+) -> torch.Tensor:
+    """Select common coordinates with low between-class semantic loading."""
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if not 0.0 < semantic_quantile <= 1.0:
+        raise ValueError("semantic_quantile must be in (0, 1]")
+    if prevalence_min < 0.0:
+        raise ValueError("prevalence_min must be nonnegative")
+
+    semantic_score = semantic_basis.pow(2).sum(dim=0)
+    prevalence = (features[idx_train.long()] > 0).float().mean(dim=0)
+    cutoff = torch.quantile(semantic_score, float(semantic_quantile))
+    eligible = (semantic_score <= cutoff) & (prevalence >= float(prevalence_min))
+    eligible_ids = eligible.nonzero(as_tuple=False).flatten()
+    if eligible_ids.numel() < int(k):
+        raise ValueError(
+            "Only {} features satisfy the sparse-positive mask filters; "
+            "cannot select K={}".format(eligible_ids.numel(), k)
+        )
+
+    ids = eligible_ids.detach().cpu().numpy()
+    values = prevalence[eligible_ids].detach().cpu().numpy()
+    order = np.lexsort((ids, -values))
+    chosen = torch.as_tensor(
+        ids[order[: int(k)]], device=features.device, dtype=torch.long
+    )
+    mask = torch.zeros(features.size(1), device=features.device, dtype=torch.bool)
+    mask[chosen] = True
+    return mask
+
+
 class MessageShortcutCode(nn.Module):
     """Learnable shared message-space shortcut q.
 
@@ -298,6 +336,59 @@ class MessageShortcutCode(nn.Module):
         )
 
 
+class SparsePositiveShortcutCode(nn.Module):
+    """Learn a nonnegative unit direction supported on a fixed feature mask."""
+
+    def __init__(
+        self,
+        feature_mask: torch.Tensor,
+        semantic_basis: torch.Tensor,
+        init_scale: float = 0.10,
+        max_scale: float = 1.0,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        if feature_mask.dim() != 1 or not bool(feature_mask.any()):
+            raise ValueError("feature_mask must be a nonempty 1-D mask")
+        if init_scale <= 0 or max_scale <= 0:
+            raise ValueError("shortcut scales must be positive")
+
+        self.max_scale = float(max_scale)
+        self.raw = nn.Parameter(torch.randn(feature_mask.numel(), device=device))
+        self.log_scale = nn.Parameter(
+            torch.tensor(float(np.log(init_scale)), device=device)
+        )
+        self.register_buffer(
+            "feature_mask", feature_mask.detach().clone().to(device=device)
+        )
+        self.register_buffer(
+            "semantic_basis", semantic_basis.detach().clone().to(device=device)
+        )
+
+    def scale(self) -> torch.Tensor:
+        return torch.exp(self.log_scale)
+
+    def direction(self) -> torch.Tensor:
+        positive = torch.nn.functional.softplus(self.raw)
+        masked = positive * self.feature_mask.to(dtype=positive.dtype)
+        return masked / masked.norm().clamp_min(EPS)
+
+    def forward(self) -> torch.Tensor:
+        return self.scale() * self.direction()
+
+    @torch.no_grad()
+    def clamp_scale(self) -> None:
+        self.log_scale.clamp_(max=float(np.log(self.max_scale)))
+
+    @torch.no_grad()
+    def semantic_leakage(self) -> float:
+        q = self.forward()
+        if self.semantic_basis.numel() == 0:
+            return 0.0
+        component = self.semantic_basis.t() @ (self.semantic_basis @ q)
+        return float(component.norm() / (q.norm() + EPS))
+
+
 @dataclass
 class CompensationPlan:
     """All graph-dependent terms needed to realize residual == q."""
@@ -343,6 +434,53 @@ class CompensationPlan:
             self.edge_weight,
             trigger_features,
         )
+
+
+def _validate_plan_features(base_features: torch.Tensor, plan: CompensationPlan) -> None:
+    if base_features.size(0) != plan.num_base_nodes:
+        raise ValueError("base_features node count no longer matches this plan")
+
+
+def _materialize_exact_payload(
+    base_features: torch.Tensor,
+    plan: CompensationPlan,
+    q: torch.Tensor,
+    victim_carrier: bool,
+):
+    _validate_plan_features(base_features, plan)
+    if q.dim() != 1 or q.numel() != base_features.size(1):
+        raise ValueError("q must be a 1-D vector matching the feature dimension")
+
+    if victim_carrier:
+        carrier = base_features[plan.idx_attach]
+    else:
+        carrier = torch.zeros_like(base_features[plan.idx_attach])
+
+    # plan.c already sums all k identical trigger-to-victim coefficients.
+    per_victim_trigger = carrier + q.view(1, -1) / plan.c
+    trigger_features = per_victim_trigger.repeat_interleave(
+        plan.trigger_size, dim=0
+    )
+    update_x = torch.cat([base_features, trigger_features], dim=0)
+    return update_x, plan.edge_index, plan.edge_weight, trigger_features
+
+
+def materialize_exact_payload_carrier(
+    base_features: torch.Tensor,
+    plan: CompensationPlan,
+    q: torch.Tensor,
+):
+    """Realize payload residual q over copies of each victim's features."""
+    return _materialize_exact_payload(base_features, plan, q, victim_carrier=True)
+
+
+def materialize_exact_payload_zero(
+    base_features: torch.Tensor,
+    plan: CompensationPlan,
+    q: torch.Tensor,
+):
+    """Exact-payload ablation using a zero carrier."""
+    return _materialize_exact_payload(base_features, plan, q, victim_carrier=False)
 
 
 @torch.no_grad()
@@ -517,4 +655,77 @@ def diagnose_message_residual(
         "trigger_norm_max": float(
             trigger_features.norm(dim=1).max()
         ),
+    }
+
+
+@torch.no_grad()
+def diagnose_payload_residual(
+    base_features: torch.Tensor,
+    base_edge_index: torch.Tensor,
+    base_edge_weight: Optional[torch.Tensor],
+    plan: CompensationPlan,
+    q: torch.Tensor,
+    realization: str = "exact_payload_carrier",
+):
+    """Measure clean, carrier, triggered, payload, structural and total messages."""
+    if realization not in {
+        "legacy_exact_total", "exact_payload_zero", "exact_payload_carrier"
+    }:
+        raise ValueError("Unknown message realization: {}".format(realization))
+
+    zero_carrier = torch.zeros(
+        plan.trigger_ids.numel(), base_features.size(1),
+        device=base_features.device, dtype=base_features.dtype,
+    )
+    if realization == "exact_payload_carrier":
+        carrier_per_victim = base_features[plan.idx_attach]
+        carrier_features = carrier_per_victim.repeat_interleave(
+            plan.trigger_size, dim=0
+        )
+        triggered = materialize_exact_payload_carrier(base_features, plan, q)
+    elif realization == "exact_payload_zero":
+        carrier_features = zero_carrier
+        triggered = materialize_exact_payload_zero(base_features, plan, q)
+    else:
+        carrier_features = zero_carrier
+        triggered = plan.materialize(base_features, q)
+
+    carrier_x = torch.cat([base_features, carrier_features], dim=0)
+    trigger_x, trigger_ei, trigger_ew, trigger_features = triggered
+    clean_message = gcn_normalized_aggregate(
+        base_features, base_edge_index, base_edge_weight
+    )[plan.idx_attach]
+    carrier_message = gcn_normalized_aggregate(
+        carrier_x, plan.edge_index, plan.edge_weight
+    )[plan.idx_attach]
+    triggered_message = gcn_normalized_aggregate(
+        trigger_x, trigger_ei, trigger_ew
+    )[plan.idx_attach]
+
+    payload = triggered_message - carrier_message
+    structural = carrier_message - clean_message
+    total = triggered_message - clean_message
+    target = q.view(1, -1).expand_as(payload)
+    payload_error = (payload - target).norm(dim=1)
+    payload_cos = torch.nn.functional.cosine_similarity(payload, target, dim=1)
+    total_cos = torch.nn.functional.cosine_similarity(total, target, dim=1)
+    total_norm_ratio = total.norm(dim=1) / q.norm().clamp_min(EPS)
+
+    return {
+        "clean_message": clean_message,
+        "carrier_message": carrier_message,
+        "triggered_message": triggered_message,
+        "payload_residual": payload,
+        "structural_residual": structural,
+        "total_residual": total,
+        "payload_l2_mean": float(payload_error.mean()),
+        "payload_l2_max": float(payload_error.max()),
+        "payload_cos_mean": float(payload_cos.mean()),
+        "payload_cos_min": float(payload_cos.min()),
+        "total_q_cos_mean": float(total_cos.mean()),
+        "total_q_cos_min": float(total_cos.min()),
+        "total_norm_ratio_mean": float(total_norm_ratio.mean()),
+        "total_norm_ratio_min": float(total_norm_ratio.min()),
+        "trigger_norm_mean": float(trigger_features.norm(dim=1).mean()),
+        "trigger_norm_max": float(trigger_features.norm(dim=1).max()),
     }
