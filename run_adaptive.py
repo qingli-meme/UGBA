@@ -106,7 +106,7 @@ parser.add_argument(
     '--msg_code_mode',
     type=str,
     default='nonsemantic',
-    choices=['nonsemantic', 'dense_nonsemantic', 'sparse_positive', 'unprojected', 'semantic'],
+    choices=['nonsemantic', 'dense_nonsemantic', 'sparse_positive', 'simplex', 'unprojected', 'semantic'],
     help=(
         'nonsemantic: project q outside clean between-class message subspace; '
         'unprojected: learn q freely; '
@@ -114,7 +114,7 @@ parser.add_argument(
     ),
 )
 parser.add_argument('--msg_realization', type=str, default='legacy_exact_total',
-                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier'],
+                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier', 'simplex_balanced_carrier'],
                     help='Raw-feature realization of the shared message shortcut')
 parser.add_argument('--msg_shortcut_k', type=int, default=5,
                     help='Number of active coordinates in sparse-positive q')
@@ -126,6 +126,10 @@ parser.add_argument('--msg_init_scale', type=float, default=0.10,
                     help='Initial norm rho of the shared message shortcut q')
 parser.add_argument('--msg_max_scale', type=float, default=1.0,
                     help='Hard upper bound on shortcut norm')
+parser.add_argument('--msg_init_mass', type=float, default=0.05,
+                    help='Initial L1 mass rho for a simplex shortcut')
+parser.add_argument('--msg_max_mass', type=float, default=0.30,
+                    help='Sigmoid upper bound for simplex shortcut mass rho')
 parser.add_argument('--msg_lambda_scale', type=float, default=1e-3,
                     help='L2 penalty weight on message shortcut magnitude')
 parser.add_argument('--msg_outer_size', type=int, default=512,
@@ -278,7 +282,8 @@ if args.msg_diagnostics:
         clean_edge_index=data.edge_index,
         q=model.shortcut().detach(),
         shortcut=model.shortcut,
-        scale_cap=args.msg_max_scale,
+        scale_cap=(args.msg_max_mass if args.msg_code_mode == 'simplex'
+                   else args.msg_max_scale),
         output_dir=args.msg_diag_dir,
     )
 
@@ -392,6 +397,7 @@ for test_model in models:
                             plan=model.last_injection_plan,
                             q=model.shortcut().detach(),
                             realization=args.msg_realization,
+                            shortcut_code=model.shortcut,
                         )
                         architecture_key = (
                             'GraphSAGE' if args.test_model == 'GraphSage'
@@ -405,7 +411,7 @@ for test_model in models:
                         trigger_feature = induct_x[plan.trigger_ids[0, 0]]
                         payload_feature = q_now / plan.c[0, 0]
                         victim_l1 = victim_feature.abs().sum().clamp_min(1e-12)
-                        msg_diagnostics.rows[architecture_key][-1].update({
+                        realization_row = {
                             'payload_residual_l2': realization_diag['payload_l2_max'],
                             'payload_residual_cos': realization_diag['payload_cos_min'],
                             'total_residual_q_cos': realization_diag['total_q_cos_min'],
@@ -419,7 +425,14 @@ for test_model in models:
                             'trigger_l1_ratio': float(
                                 trigger_feature.abs().sum() / victim_l1
                             ),
-                        })
+                        }
+                        if args.msg_code_mode == 'simplex':
+                            realization_row['beta'] = float(
+                                model.shortcut.mass().detach() / plan.c[0, 0]
+                            )
+                        msg_diagnostics.rows[architecture_key][-1].update(
+                            realization_row
+                        )
                     train_attach_rate = (output.argmax(dim=1)[relabeled_node_idx]==args.target_class).float().mean()
                     asr += train_attach_rate
                     if(data.y[idx] != args.target_class):
@@ -488,6 +501,8 @@ if msg_diagnostics is not None:
         'shortcut_k': args.msg_shortcut_k,
         'prevalence_min': args.msg_prevalence_min,
         'semantic_quantile': args.msg_semantic_quantile,
+        'init_mass': args.msg_init_mass,
+        'max_mass': args.msg_max_mass,
     }
     q_final = model.shortcut().detach()
     q_l1 = float(q_final.abs().sum())
@@ -498,6 +513,20 @@ if msg_diagnostics is not None:
         'q_l1_l2_ratio': q_l1 / max(q_l2, 1e-12),
         'q_nnz': int((q_final.abs() > 1e-12).sum()),
     })
+    if args.msg_code_mode == 'simplex':
+        direction = model.shortcut.direction().detach()
+        mass = float(model.shortcut.mass().detach())
+        entropy = float(-(
+            direction * direction.clamp_min(1e-12).log()
+        ).sum())
+        msg_summary['shortcut'].update({
+            'rho': mass,
+            'direction_nnz': int((direction > 1e-12).sum()),
+            'direction_min': float(direction.min()),
+            'direction_max': float(direction.max()),
+            'direction_entropy': entropy,
+            'q_l1_mass_error': abs(q_l1 - mass),
+        })
     clean_l1 = data.x.abs().sum(dim=1).detach().cpu().numpy()
     msg_summary['clean_reference']['l1'] = {
         'mean': float(clean_l1.mean()),
@@ -511,6 +540,8 @@ if msg_diagnostics is not None:
         'payload_amp_ratio', 'trigger_l1', 'victim_l1',
         'trigger_l1_ratio',
     ]
+    if args.msg_code_mode == 'simplex':
+        realization_keys.append('beta')
     msg_summary['realization_diagnostics'] = {}
     for architecture, rows in msg_diagnostics.rows.items():
         msg_summary['realization_diagnostics'][architecture] = {}

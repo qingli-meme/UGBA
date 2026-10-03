@@ -81,6 +81,10 @@ class MessageShortcutBackdoor:
             return ms.materialize_exact_payload_zero(features, plan, q)
         if realization == "exact_payload_carrier":
             return ms.materialize_exact_payload_carrier(features, plan, q)
+        if realization == "simplex_balanced_carrier":
+            return ms.materialize_simplex_balanced_carrier(
+                features, plan, self.shortcut
+            )
         raise ValueError("Unknown message realization: {}".format(realization))
 
     def fit(
@@ -168,7 +172,7 @@ class MessageShortcutBackdoor:
         # 2) Learn shared shortcut q.
         # ------------------------------------------------------------
         code_mode = getattr(args, "msg_code_mode", "nonsemantic")
-        if code_mode == "sparse_positive":
+        if code_mode in {"sparse_positive", "simplex"}:
             feature_mask = ms.build_sparse_positive_mask(
                 features=features,
                 semantic_basis=self.semantic_basis,
@@ -177,13 +181,22 @@ class MessageShortcutBackdoor:
                 semantic_quantile=args.msg_semantic_quantile,
                 prevalence_min=args.msg_prevalence_min,
             )
-            self.shortcut = ms.SparsePositiveShortcutCode(
-                feature_mask=feature_mask,
-                semantic_basis=self.semantic_basis,
-                init_scale=args.msg_init_scale,
-                max_scale=args.msg_max_scale,
-                device=self.device,
-            ).to(self.device)
+            if code_mode == "simplex":
+                self.shortcut = ms.SimplexShortcutCode(
+                    feature_mask=feature_mask,
+                    semantic_basis=self.semantic_basis,
+                    init_mass=args.msg_init_mass,
+                    max_mass=args.msg_max_mass,
+                    device=self.device,
+                ).to(self.device)
+            else:
+                self.shortcut = ms.SparsePositiveShortcutCode(
+                    feature_mask=feature_mask,
+                    semantic_basis=self.semantic_basis,
+                    init_scale=args.msg_init_scale,
+                    max_scale=args.msg_max_scale,
+                    device=self.device,
+                ).to(self.device)
             prevalence = (features[idx_train] > 0).float().mean(dim=0)
             print(
                 "[MSG-MASK] K={} ids={} prevalence(mean/min/max)="
@@ -355,9 +368,11 @@ class MessageShortcutBackdoor:
                 )
             )
 
-            # q norm == learned rho^2 because direction is unit normalized.
             q = self.shortcut()
-            loss_scale = q.pow(2).sum()
+            if code_mode == "simplex":
+                loss_scale = self.shortcut.mass().pow(2)
+            else:
+                loss_scale = q.pow(2).sum()
 
             loss_outer = (
                 loss_target
@@ -432,6 +447,7 @@ class MessageShortcutBackdoor:
                 plan=self.attach_plan,
                 q=q,
                 realization=realization,
+                shortcut_code=self.shortcut,
             )
 
         print(
@@ -444,6 +460,30 @@ class MessageShortcutBackdoor:
                 self.shortcut.semantic_leakage(),
             )
         )
+
+        if code_mode == "simplex":
+            with torch.no_grad():
+                direction = self.shortcut.direction()
+                mass = self.shortcut.mass()
+                beta = (mass / self.attach_plan.c).flatten()
+                entropy = -(
+                    direction * direction.clamp_min(1e-12).log()
+                ).sum()
+            print(
+                "[MSG-SIMPLEX] rho={:.8f} q_l1={:.8f} q_l2={:.8f} "
+                "r_nnz={} r_min={:.8f} r_max={:.8f} entropy={:.8f}".format(
+                    float(mass), float(q.abs().sum()), float(q.norm()),
+                    int((direction > 1e-12).sum()), float(direction.min()),
+                    float(direction.max()), float(entropy),
+                )
+            )
+            print(
+                "[MSG-BETA] min={:.8f} mean={:.8f} median={:.8f} "
+                "p95={:.8f} max={:.8f}".format(
+                    float(beta.min()), float(beta.mean()), float(beta.median()),
+                    float(torch.quantile(beta, 0.95)), float(beta.max()),
+                )
+            )
 
         print(
             "[MSG-PAYLOAD] l2(mean/max)="

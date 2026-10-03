@@ -389,6 +389,67 @@ class SparsePositiveShortcutCode(nn.Module):
         return float(component.norm() / (q.norm() + EPS))
 
 
+class SimplexShortcutCode(nn.Module):
+    """Sparse nonnegative shortcut whose L1 mass is a bounded scalar rho."""
+
+    def __init__(
+        self,
+        feature_mask: torch.Tensor,
+        semantic_basis: torch.Tensor,
+        init_mass: float = 0.05,
+        max_mass: float = 0.30,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        if feature_mask.dim() != 1 or not bool(feature_mask.any()):
+            raise ValueError("feature_mask must be a nonempty 1-D mask")
+        if not 0.0 < init_mass < max_mass:
+            raise ValueError("init_mass must be in (0, max_mass)")
+        self.max_mass = float(max_mass)
+        self.raw_direction = nn.Parameter(
+            torch.randn(feature_mask.numel(), device=device)
+        )
+        initial_probability = float(init_mass) / self.max_mass
+        initial_logit = np.log(initial_probability / (1.0 - initial_probability))
+        self.raw_mass = nn.Parameter(
+            torch.tensor(float(initial_logit), device=device)
+        )
+        self.register_buffer(
+            "feature_mask", feature_mask.detach().clone().to(device=device)
+        )
+        self.register_buffer(
+            "semantic_basis", semantic_basis.detach().clone().to(device=device)
+        )
+
+    def direction(self) -> torch.Tensor:
+        positive = torch.nn.functional.softplus(self.raw_direction)
+        masked = positive * self.feature_mask.to(dtype=positive.dtype)
+        return masked / masked.sum().clamp_min(EPS)
+
+    def mass(self) -> torch.Tensor:
+        return self.max_mass * torch.sigmoid(self.raw_mass)
+
+    def scale(self) -> torch.Tensor:
+        """Compatibility alias: simplex shortcut strength is its L1 mass."""
+        return self.mass()
+
+    def forward(self) -> torch.Tensor:
+        return self.mass() * self.direction()
+
+    @torch.no_grad()
+    def clamp_scale(self) -> None:
+        # The sigmoid parameterization already enforces 0 < rho < max_mass.
+        return None
+
+    @torch.no_grad()
+    def semantic_leakage(self) -> float:
+        q = self.forward()
+        if self.semantic_basis.numel() == 0:
+            return 0.0
+        component = self.semantic_basis.t() @ (self.semantic_basis @ q)
+        return float(component.norm() / (q.norm() + EPS))
+
+
 @dataclass
 class CompensationPlan:
     """All graph-dependent terms needed to realize residual == q."""
@@ -481,6 +542,47 @@ def materialize_exact_payload_zero(
 ):
     """Exact-payload ablation using a zero carrier."""
     return _materialize_exact_payload(base_features, plan, q, victim_carrier=False)
+
+
+def materialize_simplex_balanced_carrier(
+    base_features: torch.Tensor,
+    plan: CompensationPlan,
+    shortcut_code: SimplexShortcutCode,
+):
+    """Exchange victim feature mass for an exact shared malicious payload."""
+    _validate_plan_features(base_features, plan)
+    direction = shortcut_code.direction()
+    mass = shortcut_code.mass()
+    beta = mass / plan.c
+    if float(beta.min().detach()) < -1e-12:
+        raise RuntimeError("Simplex carrier beta must be nonnegative")
+    if float(beta.max().detach()) > 1.0 + 1e-7:
+        raise RuntimeError(
+            "Simplex carrier is infeasible: beta max {:.8f} exceeds 1".format(
+                float(beta.max().detach())
+            )
+        )
+
+    victim_features = base_features[plan.idx_attach]
+    per_victim_trigger = (
+        (1.0 - beta) * victim_features
+        + beta * direction.view(1, -1)
+    )
+    if float(per_victim_trigger.min().detach()) < -1e-7:
+        raise RuntimeError("Simplex carrier produced negative trigger features")
+    row_mass_error = (per_victim_trigger.sum(dim=1) - 1.0).abs()
+    if float(row_mass_error.max().detach()) > 1e-5:
+        raise RuntimeError(
+            "Simplex carrier failed row-mass conservation: max error {:.3e}".format(
+                float(row_mass_error.max().detach())
+            )
+        )
+
+    trigger_features = per_victim_trigger.repeat_interleave(
+        plan.trigger_size, dim=0
+    )
+    update_x = torch.cat([base_features, trigger_features], dim=0)
+    return update_x, plan.edge_index, plan.edge_weight, trigger_features
 
 
 @torch.no_grad()
@@ -666,10 +768,12 @@ def diagnose_payload_residual(
     plan: CompensationPlan,
     q: torch.Tensor,
     realization: str = "exact_payload_carrier",
+    shortcut_code: Optional[nn.Module] = None,
 ):
     """Measure clean, carrier, triggered, payload, structural and total messages."""
     if realization not in {
-        "legacy_exact_total", "exact_payload_zero", "exact_payload_carrier"
+        "legacy_exact_total", "exact_payload_zero", "exact_payload_carrier",
+        "simplex_balanced_carrier",
     }:
         raise ValueError("Unknown message realization: {}".format(realization))
 
@@ -677,7 +781,19 @@ def diagnose_payload_residual(
         plan.trigger_ids.numel(), base_features.size(1),
         device=base_features.device, dtype=base_features.dtype,
     )
-    if realization == "exact_payload_carrier":
+    if realization == "simplex_balanced_carrier":
+        if shortcut_code is None or not hasattr(shortcut_code, "mass"):
+            raise ValueError("simplex realization requires a simplex shortcut_code")
+        mass = shortcut_code.mass()
+        beta = mass / plan.c
+        carrier_per_victim = (1.0 - beta) * base_features[plan.idx_attach]
+        carrier_features = carrier_per_victim.repeat_interleave(
+            plan.trigger_size, dim=0
+        )
+        triggered = materialize_simplex_balanced_carrier(
+            base_features, plan, shortcut_code
+        )
+    elif realization == "exact_payload_carrier":
         carrier_per_victim = base_features[plan.idx_attach]
         carrier_features = carrier_per_victim.repeat_interleave(
             plan.trigger_size, dim=0
