@@ -125,6 +125,10 @@ parser.add_argument('--msg_verify_tol', type=float, default=1e-5,
                     help='Maximum allowed L2 error for residual == q diagnostic')
 parser.add_argument('--msg_cos_tol', type=float, default=1e-5,
                     help='Allowed cosine deviation from 1 for residual == q diagnostic')
+parser.add_argument('--msg_diagnostics', action='store_true', default=False,
+                    help='Export per-victim Message-Shortcut v2 diagnostics')
+parser.add_argument('--msg_diag_dir', type=str, default='results/message_diag',
+                    help='Directory for Message-Shortcut v2 CSV/JSON diagnostics')
 parser.add_argument('--test_model', type=str, default='GCN',
                     choices=['GCN','GAT','GraphSage','GIN'],
                     help='Model used to attack')
@@ -249,6 +253,24 @@ else:
 model.fit(data.x, train_edge_index, None, data.y, idx_train,idx_attach, unlabeled_idx)
 poison_x, poison_edge_index, poison_edge_weights, poison_labels = model.get_poisoned()
 
+msg_diagnostics = None
+if args.msg_diagnostics:
+    if args.attack_method != 'message_shortcut':
+        raise ValueError('--msg_diagnostics requires --attack_method message_shortcut')
+    if args.evaluate_mode != '1by1':
+        raise ValueError('--msg_diagnostics requires --evaluate_mode 1by1')
+    if args.defense_mode != 'none':
+        raise ValueError('Run v2 diagnostics before defenses (--defense_mode none)')
+    from diagnostics.analyze_message_shortcut_v2 import MessageShortcutV2Diagnostics
+    msg_diagnostics = MessageShortcutV2Diagnostics(
+        clean_x=data.x,
+        clean_edge_index=data.edge_index,
+        q=model.shortcut().detach(),
+        shortcut=model.shortcut,
+        scale_cap=args.msg_max_scale,
+        output_dir=args.msg_diag_dir,
+    )
+
 if(args.defense_mode == 'prune'):
     poison_edge_index,poison_edge_weights = prune_unrelated_edge(args,poison_edge_index,poison_edge_weights,poison_x,device,large_graph=False)
     bkd_tn_nodes = torch.cat([idx_train,idx_attach]).to(device)
@@ -309,6 +331,14 @@ for test_model in models:
                 relabeled_node_idx = sub_mapping
                 sub_induct_edge_weights = torch.ones([sub_induct_edge_index.shape[1]]).to(device)
                 with torch.no_grad():
+                    clean_output = None
+                    if msg_diagnostics is not None:
+                        test_model.eval()
+                        clean_output = test_model(
+                            poison_x[sub_induct_nodeset],
+                            sub_induct_edge_index,
+                            sub_induct_edge_weights,
+                        )
                     # inject trigger on attack test nodes (idx_atk)'''
                     induct_x, induct_edge_index,induct_edge_weights = model.inject_trigger(
                         relabeled_node_idx,
@@ -323,6 +353,25 @@ for test_model in models:
                         induct_edge_index,induct_edge_weights = prune_unrelated_edge(args,induct_edge_index,induct_edge_weights,induct_x,device,False)
                     # attack evaluation
                     output = test_model(induct_x,induct_edge_index,induct_edge_weights)
+                    if msg_diagnostics is not None:
+                        msg_diagnostics.add_victim(
+                            architecture=args.test_model,
+                            seed=args.seed,
+                            node_id=idx,
+                            label=data.y[idx],
+                            target_class=args.target_class,
+                            model=test_model,
+                            clean_logits=clean_output,
+                            trigger_logits=output,
+                            victim_local=int(relabeled_node_idx.item()),
+                            base_x=poison_x[sub_induct_nodeset],
+                            base_edge_index=sub_induct_edge_index,
+                            base_edge_weight=sub_induct_edge_weights,
+                            trigger_x=induct_x,
+                            trigger_edge_index=induct_edge_index,
+                            trigger_edge_weight=induct_edge_weights,
+                            plan=model.last_injection_plan,
+                        )
                     train_attach_rate = (output.argmax(dim=1)[relabeled_node_idx]==args.target_class).float().mean()
                     asr += train_attach_rate
                     if(data.y[idx] != args.target_class):
@@ -378,3 +427,6 @@ total_overall_asr = total_overall_asr/len(models)
 total_overall_ca = total_overall_ca/len(models)
 print("Total Overall ASR: {:.4f} ".format(total_overall_asr))
 print("Total Clean Accuracy: {:.4f}".format(total_overall_ca))
+if msg_diagnostics is not None:
+    msg_diagnostics.finalize()
+    print("[MSG-DIAG-V2] wrote CSV/JSON diagnostics to {}".format(args.msg_diag_dir))

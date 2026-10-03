@@ -47,6 +47,7 @@ class MessageShortcutBackdoor:
 
         self.semantic_basis = None
         self.target_semantic_direction = None
+        self.last_injection_plan = None
 
     @staticmethod
     def _edge_weights(edge_index, edge_weight, device, dtype):
@@ -458,6 +459,7 @@ class MessageShortcutBackdoor:
             idx_attach=idx_attach,
             trigger_size=self.args.trigger_size,
         )
+        self.last_injection_plan = plan
 
         with torch.no_grad():
             q = self.shortcut()
