@@ -114,7 +114,7 @@ parser.add_argument(
     ),
 )
 parser.add_argument('--msg_realization', type=str, default='legacy_exact_total',
-                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier', 'simplex_balanced_carrier', 'neutral_message_token'],
+                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier', 'simplex_balanced_carrier', 'neutral_message_token', 'neutral_mass_completion'],
                     help='Raw-feature realization of the shared message shortcut')
 parser.add_argument('--msg_shortcut_k', type=int, default=5,
                     help='Number of active coordinates in sparse-positive q')
@@ -159,10 +159,11 @@ parser.add_argument('--device_id', type=int, default=0,
 args = parser.parse_known_args()[0]
 if not 0.0 <= args.msg_token_eta <= 1.0:
     raise ValueError('--msg_token_eta must be in [0, 1]')
-if args.msg_code_mode == 'message_token' and args.msg_realization != 'neutral_message_token':
-    raise ValueError('message_token requires --msg_realization neutral_message_token')
-if args.msg_realization == 'neutral_message_token' and args.msg_code_mode != 'message_token':
-    raise ValueError('neutral_message_token requires --msg_code_mode message_token')
+token_realizations = {'neutral_message_token', 'neutral_mass_completion'}
+if args.msg_code_mode == 'message_token' and args.msg_realization not in token_realizations:
+    raise ValueError('message_token requires a neutral token realization')
+if args.msg_realization in token_realizations and args.msg_code_mode != 'message_token':
+    raise ValueError('neutral token realizations require --msg_code_mode message_token')
 args.cuda =  not args.no_cuda and torch.cuda.is_available()
 device = torch.device(('cuda:{}' if torch.cuda.is_available() else 'cpu').format(args.device_id))
 
@@ -399,7 +400,16 @@ for test_model in models:
                             plan=model.last_injection_plan,
                         )
                         import message_shortcut as ms
-                        if args.msg_code_mode == 'message_token':
+                        if args.msg_realization == 'neutral_mass_completion':
+                            realization_diag = ms.diagnose_mass_completion(
+                                base_features=poison_x[sub_induct_nodeset],
+                                base_edge_index=sub_induct_edge_index,
+                                base_edge_weight=sub_induct_edge_weights,
+                                plan=model.last_injection_plan,
+                                token_code=model.shortcut,
+                                eta=args.msg_token_eta,
+                            )
+                        elif args.msg_code_mode == 'message_token':
                             realization_diag = ms.diagnose_message_token(
                                 base_features=poison_x[sub_induct_nodeset],
                                 base_edge_index=sub_induct_edge_index,
@@ -447,6 +457,21 @@ for test_model in models:
                                 'victim_l1': float(victim_l1),
                                 'trigger_l1_ratio': float(trigger_feature.abs().sum() / victim_l1),
                             }
+                            if args.msg_realization == 'neutral_mass_completion':
+                                realization_row.update({
+                                    'completion_capacity': float(
+                                        realization_diag['completion_capacity'][0, 0]
+                                    ),
+                                    'expected_trigger_l1': float(
+                                        realization_diag['expected_trigger_mass'][0, 0]
+                                    ),
+                                    'carrier_preservation_l2': realization_diag[
+                                        'carrier_preservation_l2_max'
+                                    ],
+                                    'residual_token_cos': realization_diag[
+                                        'residual_token_cos_min'
+                                    ],
+                                })
                         else:
                             payload_feature = q_now / plan.c[0, 0]
                             realization_row = {
@@ -589,6 +614,11 @@ if msg_diagnostics is not None:
             'prototype_l1', 'prototype_nnz', 'prototype_victim_cos',
             'trigger_l1', 'victim_l1', 'trigger_l1_ratio',
         ]
+        if args.msg_realization == 'neutral_mass_completion':
+            realization_keys.extend([
+                'completion_capacity', 'expected_trigger_l1',
+                'carrier_preservation_l2', 'residual_token_cos',
+            ])
     else:
         realization_keys = [
             'payload_residual_l2', 'payload_residual_cos',

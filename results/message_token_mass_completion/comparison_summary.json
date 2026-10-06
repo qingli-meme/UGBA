@@ -1,0 +1,59 @@
+{
+  "dataset": "Cora",
+  "model": "GCN",
+  "attack_budget": 10,
+  "trigger_size": 3,
+  "token_support": 5,
+  "realization": "neutral_mass_completion",
+  "runs": [
+    {
+      "eta": 0.25,
+      "asr": 0.4597786068916321,
+      "clean_accuracy": 0.8400000000000001,
+      "mean_alpha": 0.13157942517767093,
+      "mean_delta_margin": 2.092865032595462,
+      "mean_clean_edge_percentile": 0.7366783235850547,
+      "mean_ood_percentile": 0.28985049082396286
+    },
+    {
+      "eta": 0.5,
+      "asr": 0.8044281005859375,
+      "clean_accuracy": 0.8422222222222222,
+      "mean_alpha": 0.26315885039383197,
+      "mean_delta_margin": 4.1222858265757125,
+      "mean_clean_edge_percentile": 0.48146172443156793,
+      "mean_ood_percentile": 0.9593673521668745
+    },
+    {
+      "eta": 0.75,
+      "asr": 0.9254612922668457,
+      "clean_accuracy": 0.8407407407407408,
+      "mean_alpha": 0.39473827050180893,
+      "mean_delta_margin": 5.388540617390312,
+      "mean_clean_edge_percentile": 0.35333886116428426,
+      "mean_ood_percentile": 0.996349479742951,
+      "success_mean_alpha": 0.3995556586690877,
+      "failed_mean_alpha": 0.33492634216747663
+    },
+    {
+      "eta": 1.0,
+      "asr": 0.9571955800056458,
+      "clean_accuracy": 0.8407407407407408,
+      "mean_alpha": 0.5263177010076072,
+      "mean_delta_margin": 6.302086764640034,
+      "mean_clean_edge_percentile": 0.27979260846037796,
+      "mean_ood_percentile": 0.999651163424485,
+      "success_mean_alpha": 0.5311646562819308,
+      "failed_mean_alpha": 0.41792975289040596,
+      "failed_mean_degree": 11.03448275862069,
+      "failed_mean_c_v": 0.6364983181501257
+    }
+  ],
+  "invariants": {
+    "max_neutral_message_l2": 2.932926790322199e-08,
+    "max_carrier_preservation_l2": 2.9600313311561877e-08,
+    "max_residual_formula_l2": 1.1922384146600962e-07,
+    "max_token_recovery_l2": 4.698707414263481e-07,
+    "residual_directly_collinear_with_token": true
+  }
+}

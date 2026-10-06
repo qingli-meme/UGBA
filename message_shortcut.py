@@ -695,6 +695,65 @@ def materialize_neutral_message_token(
     return update_x, plan.edge_index, plan.edge_weight, trigger_features
 
 
+def materialize_neutral_mass_completion(
+    base_features: torch.Tensor,
+    plan: CompensationPlan,
+    token_code: MessageTokenCode,
+    eta: float,
+):
+    """Keep the neutral carrier and fill its unused clean-node mass with s.
+
+    For victim mass M_v and neutral-prototype mass L_v:
+        x_t(v) = p_v + eta * (M_v - L_v) * s.
+    """
+    _validate_plan_features(base_features, plan)
+    if not 0.0 <= float(eta) <= 1.0:
+        raise ValueError("eta must be in [0, 1]")
+    if float(base_features.min().detach()) < -1e-7:
+        raise RuntimeError("Mass completion requires nonnegative base features")
+
+    token = token_code()
+    if token.dim() != 1 or token.numel() != base_features.size(1):
+        raise ValueError("token must match the feature dimension")
+    prototype, _normalized, prototype_mass = neutral_local_prototype(plan)
+    victim_mass = base_features[plan.idx_attach].sum(dim=1, keepdim=True)
+    capacity = victim_mass - prototype_mass
+    min_capacity = float(capacity.min().detach())
+    if min_capacity < -1e-6:
+        bad = (capacity.flatten() < -1e-6).nonzero(as_tuple=False).flatten()
+        raise RuntimeError(
+            "Neutral prototype exceeds victim feature mass for victims {} "
+            "(min capacity={:.3e})".format(
+                plan.idx_attach[bad].detach().cpu().tolist(), min_capacity
+            )
+        )
+    capacity = capacity.clamp_min(0.0)
+    per_victim_trigger = (
+        prototype + float(eta) * capacity * token.view(1, -1)
+    )
+    if not bool(torch.isfinite(per_victim_trigger).all()):
+        raise RuntimeError("Mass completion produced non-finite features")
+    if float(per_victim_trigger.min().detach()) < -1e-7:
+        raise RuntimeError("Mass completion produced negative features")
+
+    expected_mass = prototype_mass + float(eta) * capacity
+    mass_error = (
+        per_victim_trigger.sum(dim=1, keepdim=True) - expected_mass
+    ).abs()
+    if float(mass_error.max().detach()) > 1e-5:
+        raise RuntimeError(
+            "Mass completion failed row-mass identity: {:.3e}".format(
+                float(mass_error.max().detach())
+            )
+        )
+
+    trigger_features = per_victim_trigger.repeat_interleave(
+        plan.trigger_size, dim=0
+    )
+    update_x = torch.cat([base_features, trigger_features], dim=0)
+    return update_x, plan.edge_index, plan.edge_weight, trigger_features
+
+
 @torch.no_grad()
 def build_compensation_plan(
     features: torch.Tensor,
@@ -1029,6 +1088,114 @@ def diagnose_message_token(
         "prototype_mass_mean": float(mass.mean()),
         "prototype_mass_min": float(mass.min()),
         "prototype_mass_max": float(mass.max()),
+        "trigger_mass_error_max": float(trigger_mass_error.max()),
+        "trigger_norm_mean": float(trigger_features.norm(dim=1).mean()),
+        "trigger_norm_max": float(trigger_features.norm(dim=1).max()),
+    }
+
+
+@torch.no_grad()
+def diagnose_mass_completion(
+    base_features: torch.Tensor,
+    base_edge_index: torch.Tensor,
+    base_edge_weight: Optional[torch.Tensor],
+    plan: CompensationPlan,
+    token_code: MessageTokenCode,
+    eta: float,
+):
+    """Verify neutral-carrier preservation and direct token residual."""
+    prototype, normalized, prototype_mass = neutral_local_prototype(plan)
+    victim_mass = base_features[plan.idx_attach].sum(dim=1, keepdim=True)
+    capacity = victim_mass - prototype_mass
+    if float(capacity.min().detach()) < -1e-6:
+        raise RuntimeError("Negative feature-mass capacity in diagnostic")
+    capacity = capacity.clamp_min(0.0)
+
+    neutral_features = prototype.repeat_interleave(plan.trigger_size, dim=0)
+    neutral_x = torch.cat([base_features, neutral_features], dim=0)
+    trigger_x, trigger_ei, trigger_ew, trigger_features = (
+        materialize_neutral_mass_completion(
+            base_features, plan, token_code, eta
+        )
+    )
+    clean_message = gcn_normalized_aggregate(
+        base_features, base_edge_index, base_edge_weight
+    )[plan.idx_attach]
+    neutral_message = gcn_normalized_aggregate(
+        neutral_x, plan.edge_index, plan.edge_weight
+    )[plan.idx_attach]
+    triggered_message = gcn_normalized_aggregate(
+        trigger_x, trigger_ei, trigger_ew
+    )[plan.idx_attach]
+
+    neutral_error = (neutral_message - clean_message).norm(dim=1)
+    residual = triggered_message - clean_message
+    token = token_code()
+    alpha = float(eta) * plan.c * capacity
+    predicted = alpha * token.view(1, -1)
+    formula_error = (residual - predicted).norm(dim=1)
+
+    if float(eta) > 0.0:
+        recovered = residual / alpha.clamp_min(EPS)
+        recovery_error = (recovered - token.view(1, -1)).norm(dim=1)
+        recovery_cos = torch.nn.functional.cosine_similarity(
+            recovered, token.view(1, -1).expand_as(recovered), dim=1
+        )
+        residual_token_cos = torch.nn.functional.cosine_similarity(
+            residual, token.view(1, -1).expand_as(residual), dim=1
+        )
+    else:
+        recovered = normalized.new_full(normalized.shape, float("nan"))
+        recovery_error = normalized.new_full((normalized.size(0),), float("nan"))
+        recovery_cos = recovery_error.clone()
+        residual_token_cos = recovery_error.clone()
+
+    per_victim_trigger = trigger_features[::plan.trigger_size]
+    expected_mass = prototype_mass + float(eta) * capacity
+    trigger_mass_error = (
+        per_victim_trigger.sum(dim=1, keepdim=True) - expected_mass
+    ).abs()
+    carrier_preservation_error = (
+        per_victim_trigger
+        - float(eta) * capacity * token.view(1, -1)
+        - prototype
+    ).norm(dim=1)
+    return {
+        "clean_message": clean_message,
+        "neutral_message": neutral_message,
+        "triggered_message": triggered_message,
+        "neutral_prototype": prototype,
+        "normalized_prototype": normalized,
+        "prototype_mass": prototype_mass,
+        "victim_mass": victim_mass,
+        "completion_capacity": capacity,
+        "expected_trigger_mass": expected_mass,
+        "alpha": alpha,
+        "residual": residual,
+        "predicted_residual": predicted,
+        "recovered_token": recovered,
+        "neutral_l2_mean": float(neutral_error.mean()),
+        "neutral_l2_max": float(neutral_error.max()),
+        "carrier_preservation_l2_max": float(carrier_preservation_error.max()),
+        "residual_formula_l2_mean": float(formula_error.mean()),
+        "residual_formula_l2_max": float(formula_error.max()),
+        "token_recovery_l2_mean": float(recovery_error.mean()),
+        "token_recovery_l2_max": float(recovery_error.max()),
+        "token_recovery_cos_mean": float(recovery_cos.mean()),
+        "token_recovery_cos_min": float(recovery_cos.min()),
+        "residual_token_cos_mean": float(residual_token_cos.mean()),
+        "residual_token_cos_min": float(residual_token_cos.min()),
+        "alpha_mean": float(alpha.mean()),
+        "alpha_min": float(alpha.min()),
+        "alpha_max": float(alpha.max()),
+        "prototype_mass_mean": float(prototype_mass.mean()),
+        "prototype_mass_min": float(prototype_mass.min()),
+        "prototype_mass_max": float(prototype_mass.max()),
+        "victim_mass_mean": float(victim_mass.mean()),
+        "capacity_mean": float(capacity.mean()),
+        "capacity_min": float(capacity.min()),
+        "capacity_max": float(capacity.max()),
+        "trigger_mass_mean": float(per_victim_trigger.sum(dim=1).mean()),
         "trigger_mass_error_max": float(trigger_mass_error.max()),
         "trigger_norm_mean": float(trigger_features.norm(dim=1).mean()),
         "trigger_norm_max": float(trigger_features.norm(dim=1).max()),

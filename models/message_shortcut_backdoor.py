@@ -88,6 +88,10 @@ class MessageShortcutBackdoor:
             return ms.materialize_neutral_message_token(
                 features, plan, self.shortcut, self.args.msg_token_eta
             )
+        if realization == "neutral_mass_completion":
+            return ms.materialize_neutral_mass_completion(
+                features, plan, self.shortcut, self.args.msg_token_eta
+            )
         raise ValueError("Unknown message realization: {}".format(realization))
 
     def fit(
@@ -450,7 +454,16 @@ class MessageShortcutBackdoor:
             realization = getattr(
                 args, "msg_realization", "legacy_exact_total"
             )
-            if code_mode == "message_token":
+            if realization == "neutral_mass_completion":
+                diag = ms.diagnose_mass_completion(
+                    base_features=features,
+                    base_edge_index=edge_index,
+                    base_edge_weight=edge_weight,
+                    plan=self.attach_plan,
+                    token_code=self.shortcut,
+                    eta=args.msg_token_eta,
+                )
+            elif code_mode == "message_token":
                 diag = ms.diagnose_message_token(
                     base_features=features,
                     base_edge_index=edge_index,
@@ -513,6 +526,17 @@ class MessageShortcutBackdoor:
                     diag["prototype_mass_max"],
                 )
             )
+            if realization == "neutral_mass_completion":
+                print(
+                    "[MSG-COMPLETION] capacity(min/mean/max)="
+                    "{:.6f}/{:.6f}/{:.6f} | trigger_mass_mean={:.6f} | "
+                    "residual_token_cos(mean/min)={:.8f}/{:.8f}".format(
+                        diag["capacity_min"], diag["capacity_mean"],
+                        diag["capacity_max"], diag["trigger_mass_mean"],
+                        diag["residual_token_cos_mean"],
+                        diag["residual_token_cos_min"],
+                    )
+                )
         elif code_mode == "simplex":
             with torch.no_grad():
                 direction = self.shortcut.direction()
@@ -574,6 +598,12 @@ class MessageShortcutBackdoor:
                 or diag["token_recovery_l2_max"] > args.msg_verify_tol
                 or diag["token_recovery_cos_min"] < 1.0 - args.msg_cos_tol
             )
+            if realization == "neutral_mass_completion":
+                invariant_failed = invariant_failed or (
+                    diag["carrier_preservation_l2_max"] > args.msg_verify_tol
+                    or diag["trigger_mass_error_max"] > args.msg_verify_tol
+                    or diag["residual_token_cos_min"] < 1.0 - args.msg_cos_tol
+                )
         elif realization == "legacy_exact_total":
             total_error = (
                 diag["total_residual"] - q.view(1, -1)
