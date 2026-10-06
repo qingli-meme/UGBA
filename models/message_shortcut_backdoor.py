@@ -1,4 +1,4 @@
-"""UGBA-compatible Message-Passing Shortcut Backdoor.
+"""UGBA-compatible message-space backdoors.
 
 Main v4 principle:
     For every attached victim v, the feature-induced payload residual is q.
@@ -6,9 +6,8 @@ Main v4 principle:
 where q is shared across poisoned/test victims.
 
 The default mode additionally forces q outside the clean between-class
-message-semantic subspace, so the poisoning process must create a new
-shortcut q -> target rather than simply moving nodes along an existing
-target-class direction.
+message-semantic subspace.  The ``message_token`` mode uses a simpler object:
+one shared sparse endpoint token with naturally victim-dependent amplitude.
 """
 
 from __future__ import annotations
@@ -84,6 +83,10 @@ class MessageShortcutBackdoor:
         if realization == "simplex_balanced_carrier":
             return ms.materialize_simplex_balanced_carrier(
                 features, plan, self.shortcut
+            )
+        if realization == "neutral_message_token":
+            return ms.materialize_neutral_message_token(
+                features, plan, self.shortcut, self.args.msg_token_eta
             )
         raise ValueError("Unknown message realization: {}".format(realization))
 
@@ -172,7 +175,7 @@ class MessageShortcutBackdoor:
         # 2) Learn shared shortcut q.
         # ------------------------------------------------------------
         code_mode = getattr(args, "msg_code_mode", "nonsemantic")
-        if code_mode in {"sparse_positive", "simplex"}:
+        if code_mode in {"sparse_positive", "simplex", "message_token"}:
             feature_mask = ms.build_sparse_positive_mask(
                 features=features,
                 semantic_basis=self.semantic_basis,
@@ -181,7 +184,13 @@ class MessageShortcutBackdoor:
                 semantic_quantile=args.msg_semantic_quantile,
                 prevalence_min=args.msg_prevalence_min,
             )
-            if code_mode == "simplex":
+            if code_mode == "message_token":
+                self.shortcut = ms.MessageTokenCode(
+                    feature_mask=feature_mask,
+                    semantic_basis=self.semantic_basis,
+                    device=self.device,
+                ).to(self.device)
+            elif code_mode == "simplex":
                 self.shortcut = ms.SimplexShortcutCode(
                     feature_mask=feature_mask,
                     semantic_basis=self.semantic_basis,
@@ -369,14 +378,15 @@ class MessageShortcutBackdoor:
             )
 
             q = self.shortcut()
-            if code_mode == "simplex":
+            if code_mode == "message_token":
+                loss_scale = q.new_zeros(())
+            elif code_mode == "simplex":
                 loss_scale = self.shortcut.mass().pow(2)
             else:
                 loss_scale = q.pow(2).sum()
 
-            loss_outer = (
-                loss_target
-                + args.msg_lambda_scale * loss_scale
+            loss_outer = loss_target if code_mode == "message_token" else (
+                loss_target + args.msg_lambda_scale * loss_scale
             )
 
             loss_outer.backward()
@@ -440,15 +450,25 @@ class MessageShortcutBackdoor:
             realization = getattr(
                 args, "msg_realization", "legacy_exact_total"
             )
-            diag = ms.diagnose_payload_residual(
-                base_features=features,
-                base_edge_index=edge_index,
-                base_edge_weight=edge_weight,
-                plan=self.attach_plan,
-                q=q,
-                realization=realization,
-                shortcut_code=self.shortcut,
-            )
+            if code_mode == "message_token":
+                diag = ms.diagnose_message_token(
+                    base_features=features,
+                    base_edge_index=edge_index,
+                    base_edge_weight=edge_weight,
+                    plan=self.attach_plan,
+                    token_code=self.shortcut,
+                    eta=args.msg_token_eta,
+                )
+            else:
+                diag = ms.diagnose_payload_residual(
+                    base_features=features,
+                    base_edge_index=edge_index,
+                    base_edge_weight=edge_weight,
+                    plan=self.attach_plan,
+                    q=q,
+                    realization=realization,
+                    shortcut_code=self.shortcut,
+                )
 
         print(
             "[MSG-FINAL] mode={} realization={} q_norm={:.6f} "
@@ -461,7 +481,39 @@ class MessageShortcutBackdoor:
             )
         )
 
-        if code_mode == "simplex":
+        if code_mode == "message_token":
+            entropy = -(q * q.clamp_min(1e-12).log()).sum()
+            print(
+                "[MSG-TOKEN] eta={:.4f} l1={:.8f} l2={:.8f} nnz={} "
+                "min={:.8f} max={:.8f} entropy={:.8f}".format(
+                    args.msg_token_eta, float(q.sum()), float(q.norm()),
+                    int((q > 1e-12).sum()), float(q.min()), float(q.max()),
+                    float(entropy),
+                )
+            )
+            print(
+                "[MSG-NEUTRAL] l2(mean/max)={:.3e}/{:.3e} | "
+                "formula_l2(mean/max)={:.3e}/{:.3e} | "
+                "recovery_l2(mean/max)={:.3e}/{:.3e} | "
+                "recovery_cos(mean/min)={:.8f}/{:.8f}".format(
+                    diag["neutral_l2_mean"], diag["neutral_l2_max"],
+                    diag["residual_formula_l2_mean"],
+                    diag["residual_formula_l2_max"],
+                    diag["token_recovery_l2_mean"],
+                    diag["token_recovery_l2_max"],
+                    diag["token_recovery_cos_mean"],
+                    diag["token_recovery_cos_min"],
+                )
+            )
+            print(
+                "[MSG-AMPLITUDE] alpha(min/mean/max)={:.6f}/{:.6f}/{:.6f} | "
+                "prototype_mass(min/mean/max)={:.6f}/{:.6f}/{:.6f}".format(
+                    diag["alpha_min"], diag["alpha_mean"], diag["alpha_max"],
+                    diag["prototype_mass_min"], diag["prototype_mass_mean"],
+                    diag["prototype_mass_max"],
+                )
+            )
+        elif code_mode == "simplex":
             with torch.no_grad():
                 direction = self.shortcut.direction()
                 mass = self.shortcut.mass()
@@ -485,26 +537,27 @@ class MessageShortcutBackdoor:
                 )
             )
 
-        print(
-            "[MSG-PAYLOAD] l2(mean/max)="
-            "{:.6e}/{:.6e} | cos(mean/min)="
-            "{:.8f}/{:.8f}".format(
-                diag["payload_l2_mean"],
-                diag["payload_l2_max"],
-                diag["payload_cos_mean"],
-                diag["payload_cos_min"],
+        if code_mode != "message_token":
+            print(
+                "[MSG-PAYLOAD] l2(mean/max)="
+                "{:.6e}/{:.6e} | cos(mean/min)="
+                "{:.8f}/{:.8f}".format(
+                    diag["payload_l2_mean"],
+                    diag["payload_l2_max"],
+                    diag["payload_cos_mean"],
+                    diag["payload_cos_min"],
+                )
             )
-        )
 
-        print(
-            "[MSG-TOTAL] q_cos(mean/min)={:.8f}/{:.8f} | "
-            "norm_ratio(mean/min)={:.8f}/{:.8f}".format(
-                diag["total_q_cos_mean"],
-                diag["total_q_cos_min"],
-                diag["total_norm_ratio_mean"],
-                diag["total_norm_ratio_min"],
+            print(
+                "[MSG-TOTAL] q_cos(mean/min)={:.8f}/{:.8f} | "
+                "norm_ratio(mean/min)={:.8f}/{:.8f}".format(
+                    diag["total_q_cos_mean"],
+                    diag["total_q_cos_min"],
+                    diag["total_norm_ratio_mean"],
+                    diag["total_norm_ratio_min"],
+                )
             )
-        )
 
         print(
             "[MSG-TRIGGER] norm(mean/max)="
@@ -514,7 +567,14 @@ class MessageShortcutBackdoor:
             )
         )
 
-        if realization == "legacy_exact_total":
+        if code_mode == "message_token":
+            invariant_failed = (
+                diag["neutral_l2_max"] > args.msg_verify_tol
+                or diag["residual_formula_l2_max"] > args.msg_verify_tol
+                or diag["token_recovery_l2_max"] > args.msg_verify_tol
+                or diag["token_recovery_cos_min"] < 1.0 - args.msg_cos_tol
+            )
+        elif realization == "legacy_exact_total":
             total_error = (
                 diag["total_residual"] - q.view(1, -1)
             ).norm(dim=1)

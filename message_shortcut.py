@@ -1,10 +1,11 @@
-"""Message-space primitives for Message-Passing Shortcut Backdoor.
+"""Message-space primitives for message-space graph backdoors.
 
 Core object:
     residual_v = AGG(G + T_v, X + X_T)[v] - AGG(G, X)[v]
 
-The trigger is analytically compensated so that residual_v == q for every
-attached victim, where q is a shared shortcut code.
+The legacy realizations analytically impose residual_v == q.  The message-token
+realization instead starts at the neutral prototype p_v=-b_v/c_v and blends it
+toward a shared sparse token, preserving local feature mass.
 
 This file DOES NOT modify the victim GNN.  It only reproduces the standard
 GCN symmetric-normalized aggregation used by PyG GCNConv before the learned
@@ -450,6 +451,53 @@ class SimplexShortcutCode(nn.Module):
         return float(component.norm() / (q.norm() + EPS))
 
 
+class MessageTokenCode(nn.Module):
+    """A shared K-sparse probability token with no learnable magnitude."""
+
+    def __init__(
+        self,
+        feature_mask: torch.Tensor,
+        semantic_basis: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        if feature_mask.dim() != 1 or not bool(feature_mask.any()):
+            raise ValueError("feature_mask must be a nonempty 1-D mask")
+        selected = feature_mask.nonzero(as_tuple=False).flatten().to(device=device)
+        self.raw_logits = nn.Parameter(torch.zeros(selected.numel(), device=device))
+        self.register_buffer("selected_features", selected)
+        self.register_buffer(
+            "feature_mask", feature_mask.detach().clone().to(device=device)
+        )
+        self.register_buffer(
+            "semantic_basis", semantic_basis.detach().clone().to(device=device)
+        )
+
+    def direction(self) -> torch.Tensor:
+        weights = torch.softmax(self.raw_logits, dim=0)
+        token = weights.new_zeros(self.feature_mask.numel())
+        return token.scatter(0, self.selected_features, weights)
+
+    def forward(self) -> torch.Tensor:
+        return self.direction()
+
+    def scale(self) -> torch.Tensor:
+        """Compatibility alias; token magnitude is fixed by the L1 simplex."""
+        return self.raw_logits.new_tensor(1.0)
+
+    @torch.no_grad()
+    def clamp_scale(self) -> None:
+        return None
+
+    @torch.no_grad()
+    def semantic_leakage(self) -> float:
+        token = self.forward()
+        if self.semantic_basis.numel() == 0:
+            return 0.0
+        component = self.semantic_basis.t() @ (self.semantic_basis @ token)
+        return float(component.norm() / token.norm().clamp_min(EPS))
+
+
 @dataclass
 class CompensationPlan:
     """All graph-dependent terms needed to realize residual == q."""
@@ -575,6 +623,68 @@ def materialize_simplex_balanced_carrier(
         raise RuntimeError(
             "Simplex carrier failed row-mass conservation: max error {:.3e}".format(
                 float(row_mass_error.max().detach())
+            )
+        )
+
+    trigger_features = per_victim_trigger.repeat_interleave(
+        plan.trigger_size, dim=0
+    )
+    update_x = torch.cat([base_features, trigger_features], dim=0)
+    return update_x, plan.edge_index, plan.edge_weight, trigger_features
+
+
+def neutral_local_prototype(
+    plan: CompensationPlan,
+    eps: float = EPS,
+):
+    """Return p_v=-b_v/c_v, its L1 normalization, and its feature mass."""
+    if bool((plan.c <= 0).any()):
+        raise RuntimeError("Neutral prototype requires strictly positive c_v")
+    prototype = -plan.b / plan.c
+    min_value = float(prototype.min().detach())
+    if min_value < -1e-6:
+        raise RuntimeError(
+            "Neutral prototype is not nonnegative (min={:.3e})".format(min_value)
+        )
+    prototype = prototype.clamp_min(0.0)
+    mass = prototype.sum(dim=1, keepdim=True)
+    bad = (mass.flatten() <= eps).nonzero(as_tuple=False).flatten()
+    if bad.numel():
+        victim_ids = plan.idx_attach[bad].detach().cpu().tolist()
+        raise RuntimeError(
+            "Neutral prototype has zero feature mass for victims {}".format(victim_ids)
+        )
+    normalized = prototype / mass
+    return prototype, normalized, mass
+
+
+def materialize_neutral_message_token(
+    base_features: torch.Tensor,
+    plan: CompensationPlan,
+    token_code: MessageTokenCode,
+    eta: float,
+):
+    """Blend each neutral local prototype toward one shared message token."""
+    _validate_plan_features(base_features, plan)
+    if not 0.0 <= float(eta) <= 1.0:
+        raise ValueError("eta must be in [0, 1]")
+    token = token_code()
+    if token.dim() != 1 or token.numel() != base_features.size(1):
+        raise ValueError("token must match the feature dimension")
+
+    prototype, normalized, mass = neutral_local_prototype(plan)
+    per_victim_trigger = mass * (
+        (1.0 - float(eta)) * normalized + float(eta) * token.view(1, -1)
+    )
+    if not bool(torch.isfinite(per_victim_trigger).all()):
+        raise RuntimeError("Message-token realization produced non-finite features")
+    if float(per_victim_trigger.min().detach()) < -1e-7:
+        raise RuntimeError("Message-token realization produced negative features")
+    mass_error = (per_victim_trigger.sum(dim=1, keepdim=True) - mass).abs()
+    if float(mass_error.max().detach()) > 1e-5:
+        raise RuntimeError(
+            "Message-token realization failed mass conservation: {:.3e}".format(
+                float(mass_error.max().detach())
             )
         )
 
@@ -842,6 +952,84 @@ def diagnose_payload_residual(
         "total_q_cos_min": float(total_cos.min()),
         "total_norm_ratio_mean": float(total_norm_ratio.mean()),
         "total_norm_ratio_min": float(total_norm_ratio.min()),
+        "trigger_norm_mean": float(trigger_features.norm(dim=1).mean()),
+        "trigger_norm_max": float(trigger_features.norm(dim=1).max()),
+    }
+
+
+@torch.no_grad()
+def diagnose_message_token(
+    base_features: torch.Tensor,
+    base_edge_index: torch.Tensor,
+    base_edge_weight: Optional[torch.Tensor],
+    plan: CompensationPlan,
+    token_code: MessageTokenCode,
+    eta: float,
+):
+    """Verify neutrality, the variable-amplitude residual, and shared token."""
+    prototype, normalized, mass = neutral_local_prototype(plan)
+    neutral_features = prototype.repeat_interleave(plan.trigger_size, dim=0)
+    neutral_x = torch.cat([base_features, neutral_features], dim=0)
+    trigger_x, trigger_ei, trigger_ew, trigger_features = (
+        materialize_neutral_message_token(base_features, plan, token_code, eta)
+    )
+
+    clean_message = gcn_normalized_aggregate(
+        base_features, base_edge_index, base_edge_weight
+    )[plan.idx_attach]
+    neutral_message = gcn_normalized_aggregate(
+        neutral_x, plan.edge_index, plan.edge_weight
+    )[plan.idx_attach]
+    triggered_message = gcn_normalized_aggregate(
+        trigger_x, trigger_ei, trigger_ew
+    )[plan.idx_attach]
+
+    neutral_error = (neutral_message - clean_message).norm(dim=1)
+    residual = triggered_message - clean_message
+    token = token_code()
+    alpha = float(eta) * plan.c * mass
+    predicted = alpha * (token.view(1, -1) - normalized)
+    formula_error = (residual - predicted).norm(dim=1)
+
+    if float(eta) > 0.0:
+        recovered = normalized + residual / alpha.clamp_min(EPS)
+        recovery_error = (recovered - token.view(1, -1)).norm(dim=1)
+        recovery_cos = torch.nn.functional.cosine_similarity(
+            recovered, token.view(1, -1).expand_as(recovered), dim=1
+        )
+    else:
+        recovered = normalized.new_full(normalized.shape, float("nan"))
+        recovery_error = normalized.new_full((normalized.size(0),), float("nan"))
+        recovery_cos = recovery_error.clone()
+
+    per_victim_trigger = trigger_features[::plan.trigger_size]
+    trigger_mass_error = (per_victim_trigger.sum(dim=1, keepdim=True) - mass).abs()
+    return {
+        "clean_message": clean_message,
+        "neutral_message": neutral_message,
+        "triggered_message": triggered_message,
+        "neutral_prototype": prototype,
+        "normalized_prototype": normalized,
+        "prototype_mass": mass,
+        "alpha": alpha,
+        "residual": residual,
+        "predicted_residual": predicted,
+        "recovered_token": recovered,
+        "neutral_l2_mean": float(neutral_error.mean()),
+        "neutral_l2_max": float(neutral_error.max()),
+        "residual_formula_l2_mean": float(formula_error.mean()),
+        "residual_formula_l2_max": float(formula_error.max()),
+        "token_recovery_l2_mean": float(recovery_error.mean()),
+        "token_recovery_l2_max": float(recovery_error.max()),
+        "token_recovery_cos_mean": float(recovery_cos.mean()),
+        "token_recovery_cos_min": float(recovery_cos.min()),
+        "alpha_mean": float(alpha.mean()),
+        "alpha_min": float(alpha.min()),
+        "alpha_max": float(alpha.max()),
+        "prototype_mass_mean": float(mass.mean()),
+        "prototype_mass_min": float(mass.min()),
+        "prototype_mass_max": float(mass.max()),
+        "trigger_mass_error_max": float(trigger_mass_error.max()),
         "trigger_norm_mean": float(trigger_features.norm(dim=1).mean()),
         "trigger_norm_max": float(trigger_features.norm(dim=1).max()),
     }

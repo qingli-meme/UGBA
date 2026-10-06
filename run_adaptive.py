@@ -106,7 +106,7 @@ parser.add_argument(
     '--msg_code_mode',
     type=str,
     default='nonsemantic',
-    choices=['nonsemantic', 'dense_nonsemantic', 'sparse_positive', 'simplex', 'unprojected', 'semantic'],
+    choices=['nonsemantic', 'dense_nonsemantic', 'sparse_positive', 'simplex', 'message_token', 'unprojected', 'semantic'],
     help=(
         'nonsemantic: project q outside clean between-class message subspace; '
         'unprojected: learn q freely; '
@@ -114,7 +114,7 @@ parser.add_argument(
     ),
 )
 parser.add_argument('--msg_realization', type=str, default='legacy_exact_total',
-                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier', 'simplex_balanced_carrier'],
+                    choices=['legacy_exact_total', 'exact_payload_zero', 'exact_payload_carrier', 'simplex_balanced_carrier', 'neutral_message_token'],
                     help='Raw-feature realization of the shared message shortcut')
 parser.add_argument('--msg_shortcut_k', type=int, default=5,
                     help='Number of active coordinates in sparse-positive q')
@@ -130,6 +130,8 @@ parser.add_argument('--msg_init_mass', type=float, default=0.05,
                     help='Initial L1 mass rho for a simplex shortcut')
 parser.add_argument('--msg_max_mass', type=float, default=0.30,
                     help='Sigmoid upper bound for simplex shortcut mass rho')
+parser.add_argument('--msg_token_eta', type=float, default=0.50,
+                    help='Opacity of the shared token in each neutral local prototype')
 parser.add_argument('--msg_lambda_scale', type=float, default=1e-3,
                     help='L2 penalty weight on message shortcut magnitude')
 parser.add_argument('--msg_outer_size', type=int, default=512,
@@ -155,6 +157,12 @@ parser.add_argument('--device_id', type=int, default=0,
                     help="Threshold of prunning edges")
 # args = parser.parse_args()
 args = parser.parse_known_args()[0]
+if not 0.0 <= args.msg_token_eta <= 1.0:
+    raise ValueError('--msg_token_eta must be in [0, 1]')
+if args.msg_code_mode == 'message_token' and args.msg_realization != 'neutral_message_token':
+    raise ValueError('message_token requires --msg_realization neutral_message_token')
+if args.msg_realization == 'neutral_message_token' and args.msg_code_mode != 'message_token':
+    raise ValueError('neutral_message_token requires --msg_code_mode message_token')
 args.cuda =  not args.no_cuda and torch.cuda.is_available()
 device = torch.device(('cuda:{}' if torch.cuda.is_available() else 'cpu').format(args.device_id))
 
@@ -282,7 +290,8 @@ if args.msg_diagnostics:
         clean_edge_index=data.edge_index,
         q=model.shortcut().detach(),
         shortcut=model.shortcut,
-        scale_cap=(args.msg_max_mass if args.msg_code_mode == 'simplex'
+        scale_cap=(None if args.msg_code_mode == 'message_token' else
+                   args.msg_max_mass if args.msg_code_mode == 'simplex'
                    else args.msg_max_scale),
         output_dir=args.msg_diag_dir,
     )
@@ -390,15 +399,25 @@ for test_model in models:
                             plan=model.last_injection_plan,
                         )
                         import message_shortcut as ms
-                        realization_diag = ms.diagnose_payload_residual(
-                            base_features=poison_x[sub_induct_nodeset],
-                            base_edge_index=sub_induct_edge_index,
-                            base_edge_weight=sub_induct_edge_weights,
-                            plan=model.last_injection_plan,
-                            q=model.shortcut().detach(),
-                            realization=args.msg_realization,
-                            shortcut_code=model.shortcut,
-                        )
+                        if args.msg_code_mode == 'message_token':
+                            realization_diag = ms.diagnose_message_token(
+                                base_features=poison_x[sub_induct_nodeset],
+                                base_edge_index=sub_induct_edge_index,
+                                base_edge_weight=sub_induct_edge_weights,
+                                plan=model.last_injection_plan,
+                                token_code=model.shortcut,
+                                eta=args.msg_token_eta,
+                            )
+                        else:
+                            realization_diag = ms.diagnose_payload_residual(
+                                base_features=poison_x[sub_induct_nodeset],
+                                base_edge_index=sub_induct_edge_index,
+                                base_edge_weight=sub_induct_edge_weights,
+                                plan=model.last_injection_plan,
+                                q=model.shortcut().detach(),
+                                realization=args.msg_realization,
+                                shortcut_code=model.shortcut,
+                            )
                         architecture_key = (
                             'GraphSAGE' if args.test_model == 'GraphSage'
                             else args.test_model
@@ -409,23 +428,40 @@ for test_model in models:
                             int(relabeled_node_idx.item())
                         ]
                         trigger_feature = induct_x[plan.trigger_ids[0, 0]]
-                        payload_feature = q_now / plan.c[0, 0]
                         victim_l1 = victim_feature.abs().sum().clamp_min(1e-12)
-                        realization_row = {
-                            'payload_residual_l2': realization_diag['payload_l2_max'],
-                            'payload_residual_cos': realization_diag['payload_cos_min'],
-                            'total_residual_q_cos': realization_diag['total_q_cos_min'],
-                            'total_residual_norm_ratio': realization_diag['total_norm_ratio_min'],
-                            'payload_amp_ratio': float(
-                                payload_feature.norm()
-                                / victim_feature.norm().clamp_min(1e-12)
-                            ),
-                            'trigger_l1': float(trigger_feature.abs().sum()),
-                            'victim_l1': float(victim_l1),
-                            'trigger_l1_ratio': float(
-                                trigger_feature.abs().sum() / victim_l1
-                            ),
-                        }
+                        if args.msg_code_mode == 'message_token':
+                            prototype = realization_diag['neutral_prototype'][0]
+                            alpha = realization_diag['alpha'][0, 0]
+                            realization_row = {
+                                'neutral_residual_l2': realization_diag['neutral_l2_max'],
+                                'residual_formula_l2': realization_diag['residual_formula_l2_max'],
+                                'token_recovery_l2': realization_diag['token_recovery_l2_max'],
+                                'token_recovery_cos': realization_diag['token_recovery_cos_min'],
+                                'alpha_v': float(alpha),
+                                'prototype_l1': float(prototype.sum()),
+                                'prototype_nnz': int((prototype > 1e-12).sum()),
+                                'prototype_victim_cos': float(torch.nn.functional.cosine_similarity(
+                                    prototype.view(1, -1), victim_feature.view(1, -1)
+                                )[0]),
+                                'trigger_l1': float(trigger_feature.abs().sum()),
+                                'victim_l1': float(victim_l1),
+                                'trigger_l1_ratio': float(trigger_feature.abs().sum() / victim_l1),
+                            }
+                        else:
+                            payload_feature = q_now / plan.c[0, 0]
+                            realization_row = {
+                                'payload_residual_l2': realization_diag['payload_l2_max'],
+                                'payload_residual_cos': realization_diag['payload_cos_min'],
+                                'total_residual_q_cos': realization_diag['total_q_cos_min'],
+                                'total_residual_norm_ratio': realization_diag['total_norm_ratio_min'],
+                                'payload_amp_ratio': float(
+                                    payload_feature.norm()
+                                    / victim_feature.norm().clamp_min(1e-12)
+                                ),
+                                'trigger_l1': float(trigger_feature.abs().sum()),
+                                'victim_l1': float(victim_l1),
+                                'trigger_l1_ratio': float(trigger_feature.abs().sum() / victim_l1),
+                            }
                         if args.msg_code_mode == 'simplex':
                             realization_row['beta'] = float(
                                 model.shortcut.mass().detach() / plan.c[0, 0]
@@ -503,6 +539,7 @@ if msg_diagnostics is not None:
         'semantic_quantile': args.msg_semantic_quantile,
         'init_mass': args.msg_init_mass,
         'max_mass': args.msg_max_mass,
+        'token_eta': args.msg_token_eta,
     }
     q_final = model.shortcut().detach()
     q_l1 = float(q_final.abs().sum())
@@ -513,7 +550,18 @@ if msg_diagnostics is not None:
         'q_l1_l2_ratio': q_l1 / max(q_l2, 1e-12),
         'q_nnz': int((q_final.abs() > 1e-12).sum()),
     })
-    if args.msg_code_mode == 'simplex':
+    if args.msg_code_mode == 'message_token':
+        token = model.shortcut.direction().detach()
+        entropy = float(-(token * token.clamp_min(1e-12).log()).sum())
+        msg_summary['shortcut'].update({
+            'token_l1': float(token.sum()),
+            'token_l2': float(token.norm()),
+            'token_nnz': int((token > 1e-12).sum()),
+            'token_min': float(token.min()),
+            'token_max': float(token.max()),
+            'token_entropy': entropy,
+        })
+    elif args.msg_code_mode == 'simplex':
         direction = model.shortcut.direction().detach()
         mass = float(model.shortcut.mass().detach())
         entropy = float(-(
@@ -534,12 +582,20 @@ if msg_diagnostics is not None:
         'p05': float(np.percentile(clean_l1, 5)),
         'p95': float(np.percentile(clean_l1, 95)),
     }
-    realization_keys = [
-        'payload_residual_l2', 'payload_residual_cos',
-        'total_residual_q_cos', 'total_residual_norm_ratio',
-        'payload_amp_ratio', 'trigger_l1', 'victim_l1',
-        'trigger_l1_ratio',
-    ]
+    if args.msg_code_mode == 'message_token':
+        realization_keys = [
+            'neutral_residual_l2', 'residual_formula_l2',
+            'token_recovery_l2', 'token_recovery_cos', 'alpha_v',
+            'prototype_l1', 'prototype_nnz', 'prototype_victim_cos',
+            'trigger_l1', 'victim_l1', 'trigger_l1_ratio',
+        ]
+    else:
+        realization_keys = [
+            'payload_residual_l2', 'payload_residual_cos',
+            'total_residual_q_cos', 'total_residual_norm_ratio',
+            'payload_amp_ratio', 'trigger_l1', 'victim_l1',
+            'trigger_l1_ratio',
+        ]
     if args.msg_code_mode == 'simplex':
         realization_keys.append('beta')
     msg_summary['realization_diagnostics'] = {}

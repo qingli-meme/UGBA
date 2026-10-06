@@ -112,8 +112,11 @@ class MessageShortcutV2Diagnostics:
         self.q_norm = float(self.q.norm())
         self.q_scale = float(shortcut.scale().detach())
         self.semantic_leakage = float(shortcut.semantic_leakage())
-        self.scale_cap = float(scale_cap)
-        self.hit_scale_cap = self.q_scale >= self.scale_cap * (1.0 - 1e-5)
+        self.scale_cap = None if scale_cap is None else float(scale_cap)
+        self.hit_scale_cap = (
+            None if self.scale_cap is None
+            else self.q_scale >= self.scale_cap * (1.0 - 1e-5)
+        )
         self.rows = defaultdict(list)
         self.ood_cache = {}
 

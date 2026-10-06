@@ -1,0 +1,39 @@
+{
+  "dataset": "Cora",
+  "model": "GCN",
+  "attack_budget": 10,
+  "trigger_size": 3,
+  "token_support": 5,
+  "runs": [
+    {
+      "eta": 0.25,
+      "asr": 0.3239852488040924,
+      "clean_accuracy": 0.8422222222222222,
+      "mean_alpha": 0.06872996243328626,
+      "mean_clean_edge_percentile": 0.8939166826302594,
+      "mean_ood_percentile": 0.0004183313620433102
+    },
+    {
+      "eta": 0.5,
+      "asr": 0.5151292085647583,
+      "clean_accuracy": 0.8422222222222222,
+      "mean_alpha": 0.1374599248445782,
+      "mean_clean_edge_percentile": 0.47050906848591034,
+      "mean_ood_percentile": 0.29026882218600625
+    },
+    {
+      "eta": 0.75,
+      "asr": 0.7549815773963928,
+      "clean_accuracy": 0.8414814814814815,
+      "mean_alpha": 0.20618988281026537,
+      "mean_clean_edge_percentile": 0.17517957294010228,
+      "mean_ood_percentile": 0.8067527130219603
+    }
+  ],
+  "invariants": {
+    "max_neutral_message_l2": 3.1933467425915296e-08,
+    "max_residual_formula_l2": 6.107855909931459e-08,
+    "min_token_recovery_cosine": 0.9999998807907104,
+    "mass_conserved": true
+  }
+}
