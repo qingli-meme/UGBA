@@ -99,8 +99,8 @@ parser.add_argument(
     '--attack_method',
     type=str,
     default='ugba',
-    choices=['ugba', 'message_shortcut'],
-    help='Original UGBA or message-space shortcut backdoor',
+    choices=['ugba', 'message_shortcut', 'propagation_state'],
+    help='Original UGBA, message-space shortcut, or propagation-state steering',
 )
 parser.add_argument(
     '--msg_code_mode',
@@ -146,6 +146,10 @@ parser.add_argument('--msg_diagnostics', action='store_true', default=False,
                     help='Export per-victim Message-Shortcut v2 diagnostics')
 parser.add_argument('--msg_diag_dir', type=str, default='results/message_diag',
                     help='Directory for Message-Shortcut v2 CSV/JSON diagnostics')
+parser.add_argument('--ps_eta_max', type=float, default=1.0,
+                    help='Maximum clean-feature interpolation coefficient in [0, 1]')
+parser.add_argument('--ps_anchor_chunk_size', type=int, default=256,
+                    help='Number of target anchors searched per chunk')
 parser.add_argument('--test_model', type=str, default='GCN',
                     choices=['GCN','GAT','GraphSage','GIN'],
                     help='Model used to attack')
@@ -157,6 +161,10 @@ parser.add_argument('--device_id', type=int, default=0,
                     help="Threshold of prunning edges")
 # args = parser.parse_args()
 args = parser.parse_known_args()[0]
+if not 0.0 <= args.ps_eta_max <= 1.0:
+    raise ValueError('--ps_eta_max must be in [0, 1]')
+if args.ps_anchor_chunk_size <= 0:
+    raise ValueError('--ps_anchor_chunk_size must be positive')
 if not 0.0 <= args.msg_token_eta <= 1.0:
     raise ValueError('--msg_token_eta must be in [0, 1]')
 token_realizations = {'neutral_message_token', 'neutral_mass_completion'}
@@ -215,6 +223,7 @@ mask_edge_index = data.edge_index[:,torch.bitwise_not(edge_mask)]
 from sklearn_extra import cluster
 from models.backdoor import Backdoor
 from models.message_shortcut_backdoor import MessageShortcutBackdoor
+from models.propagation_state_backdoor import PropagationStateBackdoor
 from models.construct import model_construct
 import heuristic_selection as hs
 import rpi_selection as rpis
@@ -272,6 +281,8 @@ print(unlabeled_idx)
 # train trigger generator 
 if args.attack_method == 'message_shortcut':
     model = MessageShortcutBackdoor(args, device)
+elif args.attack_method == 'propagation_state':
+    model = PropagationStateBackdoor(args, device)
 else:
     model = Backdoor(args,device)
 model.fit(data.x, train_edge_index, None, data.y, idx_train,idx_attach, unlabeled_idx)

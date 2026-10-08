@@ -1,0 +1,68 @@
+{
+  "dataset": "Cora",
+  "model": "GCN",
+  "selection_seed": 10,
+  "evaluation_seeds": [
+    265,
+    125,
+    996,
+    527,
+    320
+  ],
+  "target_class": 0,
+  "vs_number": 10,
+  "trigger_size": 3,
+  "ps_eta_max": 1.0,
+  "ps_anchor_chunk_size": 256,
+  "epochs": 200,
+  "evaluate_mode": "1by1",
+  "defense_mode": "none",
+  "target_anchor_count": 57,
+  "mean_asr": 0.3675,
+  "mean_clean_accuracy": 0.8437,
+  "mean_flip_asr_from_rounded_logs": 0.25423999999999997,
+  "per_seed": [
+    {
+      "seed": 265,
+      "asr": 0.3764,
+      "flip_asr": 0.2667,
+      "clean_accuracy": 0.8481
+    },
+    {
+      "seed": 125,
+      "asr": 0.3764,
+      "flip_asr": 0.2622,
+      "clean_accuracy": 0.8444
+    },
+    {
+      "seed": 996,
+      "asr": 0.369,
+      "flip_asr": 0.2578,
+      "clean_accuracy": 0.8444
+    },
+    {
+      "seed": 527,
+      "asr": 0.369,
+      "flip_asr": 0.2578,
+      "clean_accuracy": 0.837
+    },
+    {
+      "seed": 320,
+      "asr": 0.3469,
+      "flip_asr": 0.2267,
+      "clean_accuracy": 0.8444
+    }
+  ],
+  "training_steering": {
+    "eta_mean": 0.8557,
+    "eta_min": 0.5871,
+    "eta_max": 1.0,
+    "distance_before_mean": 0.218672,
+    "distance_after_mean": 0.175411
+  },
+  "log": "logs/PSS_Cora_GCN_eta_1.0.log",
+  "unmeasured_metrics": [
+    "edge_percentile",
+    "PCA_OOD"
+  ]
+}
